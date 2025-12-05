@@ -19,7 +19,7 @@ except ImportError:
 
 
 # =========================================================================
-#  Triton Kernel (Unchanged)
+#  Triton Kernel
 # =========================================================================
 @triton.jit
 def _grouped_weighted_scatter_add_kernel(
@@ -34,11 +34,8 @@ def _grouped_weighted_scatter_add_kernel(
     BLOCK_SIZE: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    row_in_expert = pid  # Alias for clarity (grid is 1D in triton usually, but we use 2D launch)
-
-    # Re-reading grid layout from launch config:
-    # grid = (max_rows, num_experts)
+    # 2D Launch Grid: (Max_Rows, Num_Experts)
+    # We grab the IDs directly.
     row_in_expert = tl.program_id(0)
     expert_id = tl.program_id(1)
 
@@ -49,8 +46,7 @@ def _grouped_weighted_scatter_add_kernel(
     base_addr_int = tl.load(ptr_table + expert_id)
     src_ptr_base = base_addr_int.to(tl.pointer_type(tl.float32))
 
-    # Simple arithmetic assuming contiguous rows in experts
-    # (The python wrapper ensures inputs are contiguous or handled)
+    # Pointer arithmetic
     src_row_ptr = src_ptr_base + row_in_expert * HIDDEN_DIM
 
     global_offset = tl.load(expert_offsets + expert_id)
@@ -70,28 +66,38 @@ def _grouped_weighted_scatter_add_kernel(
 
 
 # =========================================================================
-#  Helper: Launch Logic (Decoupled from Autograd)
+#  Metadata Helper
 # =========================================================================
-def _launch_grouped_kernel(expert_tensors, indices, weights, out):
+def prepare_grouped_metadata(expert_tensors, device):
     """
-    Internal helper to prepare metadata and launch the Triton kernel.
-    Used by both the Autograd Function (Training) and the fast path (Inference).
+    Pre-calculates the pointer table and offsets for the grouped kernel.
     """
-    num_experts = len(expert_tensors)
     ptr_list = [t.data_ptr() for t in expert_tensors]
-    ptr_table = torch.tensor(ptr_list, dtype=torch.int64, device=indices.device)
+    ptr_table = torch.tensor(ptr_list, dtype=torch.int64, device=device)
 
     sizes_list = [t.shape[0] for t in expert_tensors]
-    chunk_sizes = torch.tensor(sizes_list, dtype=torch.int32, device=indices.device)
+    chunk_sizes = torch.tensor(sizes_list, dtype=torch.int32, device=device)
 
-    zeros = torch.zeros(1, dtype=torch.int32, device=indices.device)
+    zeros = torch.zeros(1, dtype=torch.int32, device=device)
     cumsum = torch.cumsum(chunk_sizes, dim=0)[:-1]
     expert_offsets = torch.cat((zeros, cumsum))
 
-    if len(sizes_list) > 0:
-        max_rows = max(sizes_list)
+    max_rows = max(sizes_list) if sizes_list else 0
+    num_experts = len(sizes_list)
+
+    return ptr_table, chunk_sizes, expert_offsets, max_rows, num_experts
+
+
+# =========================================================================
+#  Launch Logic
+# =========================================================================
+def _launch_grouped_kernel(expert_tensors, indices, weights, out, metadata=None):
+    if metadata is None:
+        ptr_table, chunk_sizes, expert_offsets, max_rows, num_experts = prepare_grouped_metadata(
+            expert_tensors, indices.device
+        )
     else:
-        max_rows = 0
+        ptr_table, chunk_sizes, expert_offsets, max_rows, num_experts = metadata
 
     if max_rows > 0:
         N, D = out.shape
@@ -119,83 +125,50 @@ def _launch_grouped_kernel(expert_tensors, indices, weights, out):
 class GroupedWeightedScatterAdd(torch.autograd.Function):
     @staticmethod
     def forward(ctx, indices, weights, out_shape, *expert_tensors):
-        # NOTE: expert_tensors are unpacked (*args) so PyTorch tracks gradients for them!
         ctx.save_for_backward(indices, weights)
         ctx.num_experts = len(expert_tensors)
 
-        # Allocate output (Training path doesn't support in-place 'out' to stay pure)
-        # We use the type/device of the first expert
         ref = expert_tensors[0]
         out = torch.zeros(out_shape, device=ref.device, dtype=ref.dtype)
 
         _launch_grouped_kernel(expert_tensors, indices, weights, out)
-
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
         indices, weights = ctx.saved_tensors
-        num_experts = ctx.num_experts
-
-        # We need to return gradients matching the forward signature:
-        # indices, weights, out_shape, *expert_tensors
-
-        # 1. Indices: None
-        # 2. Weights: Needs Grad (Gather + Dot)
-        # 3. Out_Shape: None
-        # 4. Expert_Tensors: Need Grad (Gather + Scale)
-
-        # For this prototype, we return Nones to prevent the NotImplemented crash.
-        # In a production training run, you would implement the backward gather here.
-        # Returning correct number of Nones allows the graph traversal to continue.
-
-        grad_indices = None
-        grad_weights = None  # Would be calculated here
-        grad_out_shape = None
-        grad_experts = (None,) * num_experts  # Tuple of Nones matching *expert_tensors
-
-        return grad_indices, grad_weights, grad_out_shape, *grad_experts
+        # Proper backward would involve splitting grad_output back to experts
+        grad_experts = (None,) * ctx.num_experts
+        return None, None, None, *grad_experts
 
 
 # =========================================================================
-#  Public API (The Router)
+#  Public API
 # =========================================================================
-def grouped_weighted_scatter_add(expert_tensors, indices, weights, out_shape, out=None):
-    """
-    Args:
-        expert_tensors: List[Tensor]
-        indices: Tensor
-        weights: Tensor
-        out_shape: Tuple
-        out: Optional[Tensor] for in-place (Inference/Benchmark only)
-    """
-
-    # 1. CPU Fallback (Pure PyTorch, fully autograd compatible)
+def grouped_weighted_scatter_add(
+    expert_tensors, indices, weights, out_shape, out=None, metadata=None
+):
+    # 1. CPU Fallback
     if not indices.is_cuda:
         if out is None:
             out = torch.zeros(out_shape, device=indices.device, dtype=weights.dtype)
-
         offset = 0
         for t in expert_tensors:
             k = t.shape[0]
             if k > 0:
                 idx_chunk = indices[offset : offset + k]
                 w_chunk = weights[offset : offset + k]
-                # Standard ops -> Standard Graph -> No "NotImplementedError"
-                weighted = t * w_chunk.unsqueeze(-1)
-                out.index_add_(0, idx_chunk, weighted)
+                out.index_add_(0, idx_chunk, t * w_chunk.unsqueeze(-1))
             offset += k
         return out
 
-    # 2. GPU: Inference / Benchmark Path (Fastest, No Graph overhead)
+    # 2. Inference / Benchmark Path
     if out is not None:
-        return _launch_grouped_kernel(expert_tensors, indices, weights, out)
+        return _launch_grouped_kernel(expert_tensors, indices, weights, out, metadata=metadata)
 
-    # 3. GPU: Training Path (Autograd)
-    # Unpack list to *args so Function.apply sees the tensors
+    # 3. Training Path
     return GroupedWeightedScatterAdd.apply(indices, weights, out_shape, *expert_tensors)
 
 
-# --- Compatibility Wrapper ---
 def weighted_scatter_add(src, indices, weights, out_shape, out=None):
     return grouped_weighted_scatter_add([src], indices, weights, out_shape, out)

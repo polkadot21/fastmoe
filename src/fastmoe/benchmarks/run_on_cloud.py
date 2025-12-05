@@ -4,7 +4,7 @@ from loguru import logger
 from fastmoe.config import MoEScale, get_config, init_app
 
 # Import the new Grouped Kernel API
-from fastmoe.kernels.ops import grouped_weighted_scatter_add
+from fastmoe.kernels.ops import grouped_weighted_scatter_add, prepare_grouped_metadata
 
 
 def verify_correctness(expert_outputs, indices, weights, out_shape):
@@ -55,7 +55,6 @@ def benchmark_standard(expert_outputs, indices, weights, out_shape, steps):
 def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps):
     """
     FastMoE: Grouped Kernel + CUDA Graphs.
-    This simulates the ideal steady state: 1 Kernel Launch, Zero Overhead.
     """
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -63,17 +62,28 @@ def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps
 
     out_static = torch.zeros(out_shape, device=device)
 
-    # 1. Warmup (Compiles kernel)
-    grouped_weighted_scatter_add(expert_outputs, indices, weights, out_shape, out=out_static)
+    # --- 1. PREPARE METADATA (Static Graph Setup) ---
+    # We calculate this ONCE. In a real static graph, pointers don't change.
+    metadata = prepare_grouped_metadata(expert_outputs, device)
+
+    # Warmup
+    grouped_weighted_scatter_add(
+        expert_outputs, indices, weights, out_shape, out=out_static, metadata=metadata
+    )
     torch.cuda.synchronize()
 
-    # 2. Capture Graph (Optional but recommended for micro-benchmarks)
-    # Even without graphs, grouped kernel is fast. With graphs, it's instant.
+    # --- 2. CAPTURE GRAPH ---
     g = torch.cuda.CUDAGraph()
     out_static.zero_()
-    with torch.cuda.graph(g):
-        grouped_weighted_scatter_add(expert_outputs, indices, weights, out_shape, out=out_static)
 
+    with torch.cuda.graph(g):
+        # We pass the pre-calculated metadata.
+        # This prevents 'torch.tensor' allocation inside the capture.
+        grouped_weighted_scatter_add(
+            expert_outputs, indices, weights, out_shape, out=out_static, metadata=metadata
+        )
+
+    # --- 3. REPLAY ---
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
