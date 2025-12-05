@@ -132,7 +132,7 @@ def run_on_cloud():
     init_app()
 
     # --- ULTRA SCALE ---
-    TARGET_SCALE = MoEScale.GIGACHAT_ULTRA_700B
+    TARGET_SCALE = MoEScale.GIGACHAT_700B
 
     cfg = get_config(TARGET_SCALE)
     if not torch.cuda.is_available():
