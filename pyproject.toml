@@ -3,7 +3,7 @@ name = "fastmoe"
 version = "0.1.0"
 description = "High-performance Expert Parallelism with Fused Kernels"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "torch",
     "numpy",
