@@ -2,52 +2,37 @@ import torch
 from loguru import logger
 
 from fastmoe.config import MoEScale, get_config, init_app
-from fastmoe.kernels.ops import weighted_scatter_add
+
+# Import the new Grouped Kernel API
+from fastmoe.kernels.ops import grouped_weighted_scatter_add
 
 
 def verify_correctness(expert_outputs, indices, weights, out_shape):
-    """
-    Run both implementations once and compare outputs numerically.
-    """
     logger.info("Verifying numerical correctness...")
     device = expert_outputs[0].device
 
-    # 1. Run Standard Path
+    # 1. Standard
     combined = torch.cat(expert_outputs, dim=0)
     weighted = combined * weights.unsqueeze(-1)
     out_std = torch.zeros(out_shape, device=device)
     out_std.index_add_(0, indices, weighted)
 
-    # 2. Run FastMoE Path (Manual Loop)
+    # 2. FastMoE (Grouped)
     out_fast = torch.zeros(out_shape, device=device)
-    offset = 0
-    for t in expert_outputs:
-        k_len = t.shape[0]
-        idx_chunk = indices[offset : offset + k_len]
-        w_chunk = weights[offset : offset + k_len]
-        weighted_scatter_add(t, idx_chunk, w_chunk, out_shape, out=out_fast)
-        offset += k_len
+    grouped_weighted_scatter_add(expert_outputs, indices, weights, out_shape, out=out_fast)
 
     torch.cuda.synchronize()
 
-    # 3. Compare
-    # Calculate max absolute difference
     diff = (out_std - out_fast).abs().max()
-
-    # Check tolerance (Float32 precision is usually around 1e-6,
-    # but accumulation of thousands of floats can drift to 1e-4 or 1e-5)
     tol = 1e-4
     if diff > tol:
         logger.warning(f"Numerical Mismatch! Max Diff: {diff:.6f} (Tolerance: {tol})")
-        logger.warning(
-            "Note: Small differences are expected due to non-deterministic Atomic Add ordering."
-        )
     else:
         logger.success(f"Verification PASSED. Max Diff: {diff:.6e}")
 
 
 def benchmark_standard(expert_outputs, indices, weights, out_shape, steps):
-    """Standard PyTorch: Cat (Allocation) + IndexAdd"""
+    """Standard: Cat -> Weight -> IndexAdd"""
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
@@ -67,43 +52,34 @@ def benchmark_standard(expert_outputs, indices, weights, out_shape, steps):
     return start_event.elapsed_time(end_event) / steps, peak_mem
 
 
-def benchmark_fastmoe_graphed(expert_outputs, indices, weights, out_shape, steps):
-    """FastMoE: CUDA Graph Replay"""
+def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps):
+    """
+    FastMoE: Grouped Kernel + CUDA Graphs.
+    This simulates the ideal steady state: 1 Kernel Launch, Zero Overhead.
+    """
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     device = expert_outputs[0].device
 
-    static_out = torch.zeros(out_shape, device=device)
-    g = torch.cuda.CUDAGraph()
+    out_static = torch.zeros(out_shape, device=device)
 
-    # Warmup
-    offset = 0
-    for t in expert_outputs:
-        k_len = t.shape[0]
-        idx_chunk = indices[offset : offset + k_len]
-        w_chunk = weights[offset : offset + k_len]
-        weighted_scatter_add(t, idx_chunk, w_chunk, out_shape, out=static_out)
-        offset += k_len
+    # 1. Warmup (Compiles kernel)
+    grouped_weighted_scatter_add(expert_outputs, indices, weights, out_shape, out=out_static)
     torch.cuda.synchronize()
 
-    # Capture
-    static_out.zero_()
+    # 2. Capture Graph (Optional but recommended for micro-benchmarks)
+    # Even without graphs, grouped kernel is fast. With graphs, it's instant.
+    g = torch.cuda.CUDAGraph()
+    out_static.zero_()
     with torch.cuda.graph(g):
-        offset = 0
-        for t in expert_outputs:
-            k_len = t.shape[0]
-            idx_chunk = indices[offset : offset + k_len]
-            w_chunk = weights[offset : offset + k_len]
-            weighted_scatter_add(t, idx_chunk, w_chunk, out_shape, out=static_out)
-            offset += k_len
+        grouped_weighted_scatter_add(expert_outputs, indices, weights, out_shape, out=out_static)
 
-    # Replay
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
     start_event.record()
     for _ in range(steps):
-        static_out.zero_()
+        out_static.zero_()
         g.replay()
     end_event.record()
     torch.cuda.synchronize()
@@ -114,7 +90,7 @@ def benchmark_fastmoe_graphed(expert_outputs, indices, weights, out_shape, steps
 
 def run_on_cloud():
     init_app()
-    TARGET_SCALE = MoEScale.GIGACHAT_700B
+    TARGET_SCALE = MoEScale.GIGACHAT_ULTRA_700B
     cfg = get_config(TARGET_SCALE)
 
     if not torch.cuda.is_available():
@@ -123,10 +99,9 @@ def run_on_cloud():
     device = torch.device("cuda")
     logger.info(f"Target: {cfg.scale.value.upper()} | Experts: {cfg.num_experts}")
 
-    # Setup Data
+    # Data Setup
     total_tokens = cfg.total_tokens
     chunk_size = total_tokens // cfg.num_experts
-
     expert_outputs = [
         torch.randn(chunk_size, cfg.hidden_dim, device=device) for _ in range(cfg.num_experts)
     ]
@@ -136,16 +111,15 @@ def run_on_cloud():
 
     base_mem = torch.cuda.memory_allocated() / (1024**2)
 
-    # --- 1. VERIFY CORRECTNESS ---
+    # 1. Verify
     verify_correctness(expert_outputs, indices, weights, out_shape)
 
-    # --- 2. BENCHMARK ---
+    # 2. Benchmark
     logger.info("Benchmarking...")
-
     std_ms, std_mem = benchmark_standard(
         expert_outputs, indices, weights, out_shape, cfg.active_steps
     )
-    fast_ms, fast_mem = benchmark_fastmoe_graphed(
+    fast_ms, fast_mem = benchmark_fastmoe_grouped(
         expert_outputs, indices, weights, out_shape, cfg.active_steps
     )
 
