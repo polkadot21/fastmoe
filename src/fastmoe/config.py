@@ -75,7 +75,7 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
         # Configuration for massive scale (e.g., DeepSeek-V3, GPT-4 proxies)
         # The hidden dimension grows significantly, and expert count often increases.
         return MoESetup(
-            scale=MoEScale.GIGACHAT_ULTRA_700B,
+            scale=MoEScale.GIGACHAT_700B,
             batch_size=2,  # Reduced due to memory pressure
             seq_len=4096,
             hidden_dim=16384,  # Massive width
