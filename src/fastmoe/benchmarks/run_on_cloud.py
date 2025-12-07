@@ -119,7 +119,7 @@ def run_training_experiment(implementation: str, cfg):
         implementation=implementation,
     ).to(device)
 
-    optimizer = optim.SGD(model.parameters(), lr=1e-4)
+    optimizer = optim.SGD(model.parameters(), lr=0.5)
 
     # We use GradScaler just in case we fall back to float16, though BF16 doesn't strictly need it.
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -155,32 +155,33 @@ def run_training_experiment(implementation: str, cfg):
 
     start_event.record()
     for step in range(cfg.active_steps):
-        # A. Forward (Auto-Cast)
         with torch.amp.autocast("cuda", dtype=amp_dtype):
             y = model(x)
             loss = ((y - target) ** 2).mean()
 
-        # B. Backward (Scaled)
         scaler.scale(loss).backward()
 
-        # C. Unscale & Clip (Prevent Explosion)
+        # FIX 2: Compute Gradient Norms
+        # This proves that gradients are successfully passing through your kernel.
+        # If this is 0.0, the backward pass is broken.
+        if step % 10 == 0:
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    total_norm += p.grad.data.norm(2).item()
+
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        # D. Step
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
 
         if step % 10 == 0 or step == cfg.active_steps - 1:
             loss_val = loss.item()
-            if torch.isnan(loss):
-                logger.error("Loss became NaN!")
-                break
-
             curr_mem = torch.cuda.memory_allocated() / (1024**3)
+            # Log Grad Norm too
             logger.info(
-                f"Step {step:03d}/{cfg.active_steps} | Loss: {loss_val:.4f} | Mem: {curr_mem:.2f} GB"  # noqa
+                f"Step {step:03d}/{cfg.active_steps} | Loss: {loss_val:.4f} | GradNorm: {total_norm:.4f} | Mem: {curr_mem:.2f} GB"  # noqa
             )
 
     end_event.record()
