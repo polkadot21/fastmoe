@@ -4,8 +4,7 @@ import torch
 import torch.optim as optim
 from loguru import logger
 
-from fastmoe import consts
-from fastmoe.config import MoEScale, MoESetup, get_config, init_app
+from fastmoe.config import MoEScale, get_config, init_app
 from fastmoe.kernels.ops import grouped_weighted_scatter_add, prepare_grouped_metadata
 from fastmoe.models.tiny_model import TinyModel
 
@@ -98,11 +97,10 @@ def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps
     return start_event.elapsed_time(end_event) / steps, peak_mem
 
 
-def run_training_experiment(implementation: str, cfg: MoESetup):
+def run_training_experiment(implementation: str, cfg):
     """
-    Runs a realistic training loop for N steps.
+    Runs a realistic training loop for N steps using AMP (Automatic Mixed Precision).
     """
-    # Cleanup before starting a new run
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -110,7 +108,7 @@ def run_training_experiment(implementation: str, cfg: MoESetup):
     device = torch.device("cuda")
 
     # 1. Initialize Model
-    # FF_DIM set to 256 to save weight memory (since we only care about activation bandwidth)
+    # FF_DIM=256 reduces weight memory, but DIM=16384 keeps activation memory massive.
     model = TinyModel(
         in_dim=cfg.hidden_dim,
         dim=cfg.hidden_dim,
@@ -121,69 +119,79 @@ def run_training_experiment(implementation: str, cfg: MoESetup):
         implementation=implementation,
     ).to(device)
 
-    # Use SGD instead of AdamW to save ~20GB of Optimizer State
     optimizer = optim.SGD(model.parameters(), lr=1e-4)
 
-    # 2. Dummy Data (B, T, D)
+    # We use GradScaler just in case we fall back to float16, though BF16 doesn't strictly need it.
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
+
+    logger.info(f"AMP Enabled: {amp_dtype}")
+
+    # Dummy Data
     B, T, D = cfg.batch_size, cfg.seq_len, cfg.hidden_dim
     x = torch.randn(B, T, D, device=device)
     target = torch.randn(B, T, D, device=device)
 
-    logger.info(f"Running {implementation.upper()} Training Loop (Optimizer: SGD)...")
+    logger.info(f"Running {implementation.upper()} Training Loop...")
 
     # 3. Warmup
-    logger.info("Warming up (5 steps)...")
     for _ in range(5):
-        y = model(x)
-        loss = ((y - target) ** 2).sum()
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast("cuda", dtype=amp_dtype):
+            y = model(x)
+            loss = ((y - target) ** 2).mean()
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         optimizer.zero_grad()
+
     torch.cuda.synchronize()
 
     # 4. Profile
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
-    # Reset stats to ignore warmup allocations
     torch.cuda.reset_peak_memory_stats()
 
     start_event.record()
     for step in range(cfg.active_steps):
-        # Forward
-        y = model(x)
-        loss = ((y - target) ** 2).mean()
+        # A. Forward (Auto-Cast)
+        with torch.amp.autocast("cuda", dtype=amp_dtype):
+            y = model(x)
+            loss = ((y - target) ** 2).mean()
 
-        # Backward
-        loss.backward()
+        # B. Backward (Scaled)
+        scaler.scale(loss).backward()
 
-        # Step
-        optimizer.step()
+        # C. Unscale & Clip (Prevent Explosion)
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # D. Step
+        scaler.step(optimizer)
+        scaler.update()
         optimizer.zero_grad()
 
         if step % 10 == 0 or step == cfg.active_steps - 1:
+            # Check for NaN loss
+            loss_val = loss.item()
+            if torch.isnan(loss):
+                logger.error("Loss became NaN!")
+                break
+
             curr_mem = torch.cuda.memory_allocated() / (1024**3)
-            logger.info(
-                f"Step {step:03d}/{cfg.active_steps} | "
-                f"Loss: {loss.item():.4f} | "
-                f"Mem: {curr_mem:.2f} GB"
+            logger.debug(
+                f"Step {step:03d}/{cfg.active_steps} | Loss: {loss_val:.4f} | Mem: {curr_mem:.2f} GB"  # noqa
             )
 
     end_event.record()
     torch.cuda.synchronize()
 
-    # 5. Metrics
     avg_time = start_event.elapsed_time(end_event) / cfg.active_steps
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)  # GB
+    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
 
-    # Cleanup model to free VRAM for next run
-    del model
-    del optimizer
-    del x
-    del target
-    gc.collect()
-    torch.cuda.empty_cache()
-
+    # Cleanup
+    del model, optimizer, x, target
     return avg_time, peak_mem
 
 
@@ -237,7 +245,6 @@ def run_on_cloud():
     )
     logger.info("=" * 60)
 
-    # Free kernel benchmark memory
     del expert_outputs, indices, weights
     torch.cuda.empty_cache()
 
@@ -249,14 +256,14 @@ def run_on_cloud():
 
     # 1. Run Standard
     try:
-        std_time, std_mem = run_training_experiment(consts.MoEImplementation.STANDARD, cfg)
+        std_time, std_mem = run_training_experiment("standard", cfg)
         logger.info(f"Standard: {std_time:.2f} ms/step | Peak Mem: {std_mem:.2f} GB")
     except torch.cuda.OutOfMemoryError:
         logger.error("Standard: OOM (Out Of Memory)!")
         std_time, std_mem = float("inf"), float("inf")
 
     # 2. Run FastMoE
-    fast_time, fast_mem = run_training_experiment(consts.MoEImplementation.FAST, cfg)
+    fast_time, fast_mem = run_training_experiment("fast", cfg)
     logger.info(f"FastMoE:  {fast_time:.2f} ms/step | Peak Mem: {fast_mem:.2f} GB")
 
     # 3. Comparison
