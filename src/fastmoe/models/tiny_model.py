@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
+from fastmoe import consts
 from fastmoe.layers.moe import MoEFeedForward
 
 
@@ -41,14 +42,24 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, n_heads, ff_dim, use_moe=True, num_experts=4):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        ff_dim,
+        use_moe=True,
+        num_experts=4,
+        implementation=consts.MoEImplementation.FAST,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = MultiheadSelfAttention(dim, n_heads)
         self.norm2 = nn.LayerNorm(dim)
 
         if use_moe:
-            self.ff = MoEFeedForward(dim, ff_dim, num_experts=num_experts)
+            self.ff = MoEFeedForward(
+                dim, ff_dim, num_experts=num_experts, implementation=implementation
+            )
         else:
             self.ff = FeedForward(dim, ff_dim)
 
@@ -59,18 +70,28 @@ class Block(nn.Module):
 
 
 class TinyModel(nn.Module):
-    """
-    MoE-Enabled TinyModel.
-    API matches src/fsdpmodels/tiny_model.py exactly.
-    """
-
-    def __init__(self, in_dim=512, dim=512, n_heads=8, ff_dim=2048, n_layers=4, num_experts=4):
+    def __init__(
+        self,
+        in_dim=512,
+        dim=512,
+        n_heads=8,
+        ff_dim=2048,
+        n_layers=4,
+        num_experts=4,
+        implementation="fast",
+    ):
         super().__init__()
         self.inp = nn.Linear(in_dim, dim, bias=False)
-        # All blocks are MoE blocks by default here
         self.blocks = nn.ModuleList(
             [
-                Block(dim, n_heads, ff_dim, use_moe=True, num_experts=num_experts)
+                Block(
+                    dim,
+                    n_heads,
+                    ff_dim,
+                    use_moe=True,
+                    num_experts=num_experts,
+                    implementation=implementation,
+                )
                 for _ in range(n_layers)
             ]
         )

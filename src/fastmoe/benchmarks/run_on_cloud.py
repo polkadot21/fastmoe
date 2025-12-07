@@ -1,10 +1,10 @@
 import torch
+import torch.optim as optim
 from loguru import logger
 
 from fastmoe.config import MoEScale, get_config, init_app
-
-# Import the new Grouped Kernel API
 from fastmoe.kernels.ops import grouped_weighted_scatter_add, prepare_grouped_metadata
+from fastmoe.models.tiny_model import TinyModel
 
 
 def verify_correctness(expert_outputs, indices, weights, out_shape):
@@ -98,6 +98,80 @@ def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps
     return start_event.elapsed_time(end_event) / steps, peak_mem
 
 
+def run_training_experiment(implementation: str, cfg):
+    """
+    Runs a realistic training loop for N steps.
+    """
+    device = torch.device("cuda")
+
+    # 1. Initialize Model
+    # We use fewer layers (2) to focus the benchmark on the MoE layer cost.
+    model = TinyModel(
+        in_dim=cfg.hidden_dim,
+        dim=cfg.hidden_dim,
+        n_heads=16,
+        ff_dim=cfg.hidden_dim,
+        n_layers=2,
+        num_experts=cfg.num_experts,
+        implementation=implementation,
+    ).to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+
+    # 2. Dummy Data (B, T, D)
+    B, T, D = cfg.batch_size, cfg.seq_len, cfg.hidden_dim
+    x = torch.randn(B, T, D, device=device)
+    target = torch.randn(B, T, D, device=device)
+
+    logger.info(f"Running {implementation.upper()} Training Loop...")
+
+    # 3. Warmup
+    logger.info("Warming up (5 steps)...")
+    for _ in range(5):
+        y = model(x)
+        loss = ((y - target) ** 2).sum()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+    torch.cuda.synchronize()
+
+    # 4. Profile
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    torch.cuda.reset_peak_memory_stats()
+
+    start_event.record()
+    for step in range(cfg.active_steps):
+        # Forward
+        y = model(x)
+        loss = ((y - target) ** 2).sum()
+
+        # Backward
+        loss.backward()
+
+        # Step
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if step % 10 == 0 or step == cfg.active_steps - 1:
+            curr_mem = torch.cuda.memory_allocated() / (1024**3)
+            logger.debug(
+                f"Step {step:03d}/{cfg.active_steps} | "
+                f"Loss: {loss.item():.4f} | "
+                f"Mem: {curr_mem:.2f} GB"
+            )
+
+    end_event.record()
+    torch.cuda.synchronize()
+
+    # 5. Metrics
+    avg_time = start_event.elapsed_time(end_event) / cfg.active_steps
+    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)  # GB
+
+    return avg_time, peak_mem
+
+
 def run_on_cloud():
     init_app()
     TARGET_SCALE = MoEScale.GIGACHAT_700B
@@ -151,3 +225,35 @@ def run_on_cloud():
         f"{'Peak Mem (MB)':<15} | {std_mem:<12.0f} | {fast_mem:<12.0f} | {std_overhead / fast_overhead:.2f}x Less Ovhd"  # noqa
     )
     logger.info("=" * 60)
+
+    print("##################################")
+
+    if not torch.cuda.is_available():
+        logger.error("CUDA required.")
+        return
+
+    logger.info("=" * 60)
+    logger.info(f"TRAINING BENCHMARK | {TARGET_SCALE.value.upper()}")
+    logger.info(f"Experts: {cfg.num_experts} | Hidden: {cfg.hidden_dim} | Seq: {cfg.seq_len}")
+    logger.info("=" * 60)
+
+    # 1. Run Standard
+    try:
+        std_time, std_mem = run_training_experiment("standard", cfg)
+        logger.info(f"Standard: {std_time:.2f} ms/step | Peak Mem: {std_mem:.2f} GB")
+    except torch.cuda.OutOfMemoryError:
+        logger.error("Standard: OOM (Out Of Memory)!")
+        std_time, std_mem = float("inf"), float("inf")
+
+    # 2. Run FastMoE
+    fast_time, fast_mem = run_training_experiment("fast", cfg)
+    logger.info(f"FastMoE:  {fast_time:.2f} ms/step | Peak Mem: {fast_mem:.2f} GB")
+
+    # 3. Comparison
+    logger.info("-" * 60)
+    if std_time != float("inf"):
+        logger.success(f"Speedup: {std_time / fast_time:.2f}x")
+        logger.success(f"Memory Reduction: {std_mem - fast_mem:.2f} GB Saved")
+    else:
+        logger.success("FastMoE enabled training where Standard failed (OOM).")
+    logger.info("-" * 60)

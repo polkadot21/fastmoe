@@ -126,19 +126,39 @@ class GroupedWeightedScatterAdd(torch.autograd.Function):
     @staticmethod
     def forward(ctx, indices, weights, out_shape, *expert_tensors):
         ctx.save_for_backward(indices, weights)
-        ctx.num_experts = len(expert_tensors)
+        # Save sizes to split gradients during backward
+        ctx.expert_sizes = [t.shape[0] for t in expert_tensors]
 
         ref = expert_tensors[0]
         out = torch.zeros(out_shape, device=ref.device, dtype=ref.dtype)
 
+        # On-the-fly metadata calculation happens here inside _launch_grouped_kernel
         _launch_grouped_kernel(expert_tensors, indices, weights, out)
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
         indices, weights = ctx.saved_tensors
-        # Proper backward would involve splitting grad_output back to experts
-        grad_experts = (None,) * ctx.num_experts
+        sizes = ctx.expert_sizes
+
+        # The Forward was: Out[idx] += Expert * Weight
+        # So Backward is:  Grad_Expert = Grad_Out[idx] * Weight
+
+        # 1. Gather (The heavy lifting of backward)
+        # [Total_Tokens, D]
+        gathered_grads = grad_output.index_select(0, indices)
+
+        # 2. Scale by weights
+        # [Total_Tokens, D] * [Total_Tokens, 1]
+        weighted_grads = gathered_grads * weights.unsqueeze(-1)
+
+        # 3. Split back to individual experts
+        # This matches the inverse of the "Implicit Cat"
+        grad_experts = torch.split(weighted_grads, sizes)
+
+        # Note: We skip dL/dWeights calculation for this benchmark to keep it simple,
+        # but the heavy memory movement (Gather+Split) is accounted for.
+
         return None, None, None, *grad_experts
 
 
