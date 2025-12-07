@@ -1,3 +1,5 @@
+import gc
+
 import torch
 import torch.optim as optim
 from loguru import logger
@@ -63,7 +65,6 @@ def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps
     out_static = torch.zeros(out_shape, device=device)
 
     # --- 1. PREPARE METADATA (Static Graph Setup) ---
-    # We calculate this ONCE. In a real static graph, pointers don't change.
     metadata = prepare_grouped_metadata(expert_outputs, device)
 
     # Warmup
@@ -77,8 +78,6 @@ def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps
     out_static.zero_()
 
     with torch.cuda.graph(g):
-        # We pass the pre-calculated metadata.
-        # This prevents 'torch.tensor' allocation inside the capture.
         grouped_weighted_scatter_add(
             expert_outputs, indices, weights, out_shape, out=out_static, metadata=metadata
         )
@@ -102,10 +101,15 @@ def run_training_experiment(implementation: str, cfg):
     """
     Runs a realistic training loop for N steps.
     """
+    # Cleanup before starting a new run
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
     device = torch.device("cuda")
 
     # 1. Initialize Model
-    # We use fewer layers (2) to focus the benchmark on the MoE layer cost.
+    # FF_DIM set to 256 to save weight memory (since we only care about activation bandwidth)
     model = TinyModel(
         in_dim=cfg.hidden_dim,
         dim=cfg.hidden_dim,
@@ -116,14 +120,15 @@ def run_training_experiment(implementation: str, cfg):
         implementation=implementation,
     ).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+    # KEY CHANGE: Use SGD instead of AdamW to save ~20GB of Optimizer State
+    optimizer = optim.SGD(model.parameters(), lr=1e-4)
 
     # 2. Dummy Data (B, T, D)
     B, T, D = cfg.batch_size, cfg.seq_len, cfg.hidden_dim
     x = torch.randn(B, T, D, device=device)
     target = torch.randn(B, T, D, device=device)
 
-    logger.info(f"Running {implementation.upper()} Training Loop...")
+    logger.info(f"Running {implementation.upper()} Training Loop (Optimizer: SGD)...")
 
     # 3. Warmup
     logger.info("Warming up (5 steps)...")
@@ -139,6 +144,7 @@ def run_training_experiment(implementation: str, cfg):
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
+    # Reset stats to ignore warmup allocations
     torch.cuda.reset_peak_memory_stats()
 
     start_event.record()
@@ -169,6 +175,14 @@ def run_training_experiment(implementation: str, cfg):
     avg_time = start_event.elapsed_time(end_event) / cfg.active_steps
     peak_mem = torch.cuda.max_memory_allocated() / (1024**3)  # GB
 
+    # Cleanup model to free VRAM for next run
+    del model
+    del optimizer
+    del x
+    del target
+    gc.collect()
+    torch.cuda.empty_cache()
+
     return avg_time, peak_mem
 
 
@@ -183,7 +197,7 @@ def run_on_cloud():
     device = torch.device("cuda")
     logger.info(f"Target: {cfg.scale.value.upper()} | Experts: {cfg.num_experts}")
 
-    # Data Setup
+    # --- PART 1: KERNEL BENCHMARK ---
     total_tokens = cfg.total_tokens
     chunk_size = total_tokens // cfg.num_experts
     expert_outputs = [
@@ -195,11 +209,9 @@ def run_on_cloud():
 
     base_mem = torch.cuda.memory_allocated() / (1024**2)
 
-    # 1. Verify
     verify_correctness(expert_outputs, indices, weights, out_shape)
 
-    # 2. Benchmark
-    logger.info("Benchmarking...")
+    logger.info("Benchmarking Kernel...")
     std_ms, std_mem = benchmark_standard(
         expert_outputs, indices, weights, out_shape, cfg.active_steps
     )
@@ -208,8 +220,7 @@ def run_on_cloud():
     )
 
     logger.info("=" * 60)
-    logger.info(f"RESULTS | {cfg.scale.value.upper()}")
-    logger.info("=" * 60)
+    logger.info(f"KERNEL RESULTS | {cfg.scale.value.upper()}")
     logger.info(f"{'Metric':<15} | {'Standard':<12} | {'FastMoE':<12} | {'Delta':<10}")
     logger.info("-" * 60)
     logger.info(
@@ -220,16 +231,16 @@ def run_on_cloud():
     fast_overhead = fast_mem - base_mem
     if fast_overhead < 1:
         fast_overhead = 1
-
     logger.info(
         f"{'Peak Mem (MB)':<15} | {std_mem:<12.0f} | {fast_mem:<12.0f} | {std_overhead / fast_overhead:.2f}x Less Ovhd"  # noqa
     )
     logger.info("=" * 60)
 
-    if not torch.cuda.is_available():
-        logger.error("CUDA required.")
-        return
+    # Free kernel benchmark memory
+    del expert_outputs, indices, weights
+    torch.cuda.empty_cache()
 
+    # --- PART 2: TRAINING BENCHMARK ---
     logger.info("=" * 60)
     logger.info(f"TRAINING BENCHMARK | {TARGET_SCALE.value.upper()}")
     logger.info(f"Experts: {cfg.num_experts} | Hidden: {cfg.hidden_dim} | Seq: {cfg.seq_len}")
