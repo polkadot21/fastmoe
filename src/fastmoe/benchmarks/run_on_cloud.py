@@ -152,7 +152,7 @@ def run_training_experiment(implementation: str, cfg: MoESetup):
     for step in range(cfg.active_steps):
         # Forward
         y = model(x)
-        loss = ((y - target) ** 2).sum()
+        loss = ((y - target) ** 2).mean()
 
         # Backward
         loss.backward()
