@@ -173,14 +173,13 @@ def run_training_experiment(implementation: str, cfg):
         optimizer.zero_grad()
 
         if step % 10 == 0 or step == cfg.active_steps - 1:
-            # Check for NaN loss
             loss_val = loss.item()
             if torch.isnan(loss):
                 logger.error("Loss became NaN!")
                 break
 
             curr_mem = torch.cuda.memory_allocated() / (1024**3)
-            logger.debug(
+            logger.info(
                 f"Step {step:03d}/{cfg.active_steps} | Loss: {loss_val:.4f} | Mem: {curr_mem:.2f} GB"  # noqa
             )
 
