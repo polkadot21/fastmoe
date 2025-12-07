@@ -110,7 +110,7 @@ def run_training_experiment(implementation: str, cfg):
         in_dim=cfg.hidden_dim,
         dim=cfg.hidden_dim,
         n_heads=16,
-        ff_dim=cfg.hidden_dim,
+        ff_dim=256,
         n_layers=2,
         num_experts=cfg.num_experts,
         implementation=implementation,
