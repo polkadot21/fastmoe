@@ -130,7 +130,7 @@ def run_training_experiment(implementation: str, cfg):
     # Dummy Data
     B, T, D = cfg.batch_size, cfg.seq_len, cfg.hidden_dim
     x = torch.randn(B, T, D, device=device)
-    target = torch.randn(B, T, D, device=device)
+    target = x.clone()
 
     logger.info(f"Running {implementation.upper()} Training Loop...")
 
