@@ -226,8 +226,6 @@ def run_on_cloud():
     )
     logger.info("=" * 60)
 
-    print("##################################")
-
     if not torch.cuda.is_available():
         logger.error("CUDA required.")
         return
