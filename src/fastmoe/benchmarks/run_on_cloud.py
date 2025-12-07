@@ -160,10 +160,6 @@ def run_training_experiment(implementation: str, cfg):
             loss = ((y - target) ** 2).mean()
 
         scaler.scale(loss).backward()
-
-        # FIX 2: Compute Gradient Norms
-        # This proves that gradients are successfully passing through your kernel.
-        # If this is 0.0, the backward pass is broken.
         if step % 10 == 0:
             total_norm = 0.0
             for p in model.parameters():
