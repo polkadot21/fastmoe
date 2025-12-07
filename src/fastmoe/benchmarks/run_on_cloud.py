@@ -4,7 +4,8 @@ import torch
 import torch.optim as optim
 from loguru import logger
 
-from fastmoe.config import MoEScale, get_config, init_app
+from fastmoe import consts
+from fastmoe.config import MoEScale, MoESetup, get_config, init_app
 from fastmoe.kernels.ops import grouped_weighted_scatter_add, prepare_grouped_metadata
 from fastmoe.models.tiny_model import TinyModel
 
@@ -97,7 +98,7 @@ def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps
     return start_event.elapsed_time(end_event) / steps, peak_mem
 
 
-def run_training_experiment(implementation: str, cfg):
+def run_training_experiment(implementation: str, cfg: MoESetup):
     """
     Runs a realistic training loop for N steps.
     """
@@ -120,7 +121,7 @@ def run_training_experiment(implementation: str, cfg):
         implementation=implementation,
     ).to(device)
 
-    # KEY CHANGE: Use SGD instead of AdamW to save ~20GB of Optimizer State
+    # Use SGD instead of AdamW to save ~20GB of Optimizer State
     optimizer = optim.SGD(model.parameters(), lr=1e-4)
 
     # 2. Dummy Data (B, T, D)
@@ -162,7 +163,7 @@ def run_training_experiment(implementation: str, cfg):
 
         if step % 10 == 0 or step == cfg.active_steps - 1:
             curr_mem = torch.cuda.memory_allocated() / (1024**3)
-            logger.debug(
+            logger.info(
                 f"Step {step:03d}/{cfg.active_steps} | "
                 f"Loss: {loss.item():.4f} | "
                 f"Mem: {curr_mem:.2f} GB"
@@ -248,14 +249,14 @@ def run_on_cloud():
 
     # 1. Run Standard
     try:
-        std_time, std_mem = run_training_experiment("standard", cfg)
+        std_time, std_mem = run_training_experiment(consts.MoEImplementation.STANDARD, cfg)
         logger.info(f"Standard: {std_time:.2f} ms/step | Peak Mem: {std_mem:.2f} GB")
     except torch.cuda.OutOfMemoryError:
         logger.error("Standard: OOM (Out Of Memory)!")
         std_time, std_mem = float("inf"), float("inf")
 
     # 2. Run FastMoE
-    fast_time, fast_mem = run_training_experiment("fast", cfg)
+    fast_time, fast_mem = run_training_experiment(consts.MoEImplementation.FAST, cfg)
     logger.info(f"FastMoE:  {fast_time:.2f} ms/step | Peak Mem: {fast_mem:.2f} GB")
 
     # 3. Comparison
