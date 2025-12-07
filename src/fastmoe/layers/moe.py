@@ -168,6 +168,7 @@ class MoEFeedForward(nn.Module):
             combined = torch.cat(expert_outputs_list, dim=0)
 
             # 2. Weighting
+            sorted_weights = sorted_weights.to(dtype=combined.dtype)
             weighted = combined * sorted_weights.unsqueeze(-1)
 
             # 3. Index Add

@@ -104,6 +104,7 @@ def _grouped_weighted_scatter_add_kernel(
     # HIDDEN_DIM: The width of the model (e.g. 4096 or 16384)
     BLOCK_SIZE: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
+    DTYPE: tl.constexpr,
 ):
     # -----------------------------------------------------------
     # 1. Thread Block Scheduling (The "Virtual Grid")
@@ -145,7 +146,7 @@ def _grouped_weighted_scatter_add_kernel(
     # Load raw 64-bit pointer from table
     base_addr_int = tl.load(ptr_table + expert_id)
     # Cast to float32 pointer type so Triton understands stride logic
-    src_ptr_base = base_addr_int.to(tl.pointer_type(tl.float32))
+    src_ptr_base = base_addr_int.to(tl.pointer_type(DTYPE))
 
     # Calculate address for the specific row this thread is processing
     # Address = Base + (RowIndex * Stride)
@@ -261,6 +262,8 @@ def _launch_grouped_kernel(expert_tensors, indices, weights, out, metadata=None)
         # Grid covers the "Max" case. Threads for smaller experts will early-exit.
         grid = (max_rows, num_experts)
 
+        triton_dtype = get_triton_dtype(expert_tensors[0].dtype)
+
         _grouped_weighted_scatter_add_kernel[grid](
             ptr_table,
             indices,
@@ -272,6 +275,7 @@ def _launch_grouped_kernel(expert_tensors, indices, weights, out, metadata=None)
             out.stride(1),
             BLOCK_SIZE=BLOCK_SIZE,
             HIDDEN_DIM=D,
+            DTYPE=triton_dtype,
         )
     return out
 
@@ -363,3 +367,15 @@ def grouped_weighted_scatter_add(
 
 def weighted_scatter_add(src, indices, weights, out_shape, out=None):
     return grouped_weighted_scatter_add([src], indices, weights, out_shape, out)
+
+
+def get_triton_dtype(torch_dtype):
+    if torch_dtype == torch.float32:
+        return tl.float32
+    elif torch_dtype == torch.bfloat16:
+        return tl.bfloat16
+    elif torch_dtype == torch.float16:
+        return tl.float16
+    else:
+        # Fallback or error
+        return tl.float32
