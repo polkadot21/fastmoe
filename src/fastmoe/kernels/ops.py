@@ -56,24 +56,44 @@ except ImportError:
 #           This fuses many kernel launches into 1, eliminating CPU launch latency
 #           and VRAM allocation overhead.
 #
+#  SCENARIO TRACE (Mental Model):
+#  Given a batch of 8 Tokens processed by 3 Experts.
+#
+#  Data Layout (Disjoint in VRAM):
+#  - E0: 3 tokens [Ids: 0, 3, 5].  Ptr: 0xA000
+#  - E1: 2 tokens [Ids: 1, 7].     Ptr: 0xB000
+#  - E2: 3 tokens [Ids: 2, 4, 6].  Ptr: 0xC000
+#
+#  Global Metadata (Packed Order):
+#  - expert_offsets: [0, 3, 5] (E0 starts at 0, E1 at 3, E2 at 5)
+#  - indices:        [0, 3, 5,  1, 7,  2, 4, 6]  <-- The '7' is at index 4
+#
+#  Grid Launch:
+#  - We launch a 2D Grid: (Max_Rows=3, Num_Experts=3).
+
+
 @triton.jit
 def _grouped_weighted_scatter_add_kernel(
     # [Input] Indirection Table
     # A tiny tensor [Num_Experts] containing the raw 64-bit memory addresses
     # of the input tensors. This allows us to "hop" between disjoint memory buffers.
+    # List of pointers [0xA000, 0xB000, 0xC000]
     ptr_table,
     # [Input] Routing Metadata
-    # idx_ptr: Where does token 'i' go in the final output?
-    # w_ptr:   What is the gating weight for token 'i'?
+    # idx_ptr: Where does token 'i' go in the final output? - Global restoration indices
+    # w_ptr:   What is the gating weight for token 'i'? - Global gating weights
     idx_ptr,
     w_ptr,
     # [Output] Destination
     # The pre-allocated final buffer. We write directly here (Zero-Copy).
+    # Final Output Buffer
     out_ptr,
     # [Metadata] Layout helpers
     # expert_offsets: [Num_Experts]. Prefix sum of counts. Helps us map a local
     #                 expert row (0..k) to a global row ID (0..BatchSize).
+    #                 Offsets [0, 3, 5]
     # chunk_sizes:    [Num_Experts]. How many tokens does each expert have?
+    #                 Counts [3, 2, 3]
     expert_offsets,
     chunk_sizes,
     # [Stride] Output tensor strides (usually Hidden_Dim, 1)
@@ -92,6 +112,10 @@ def _grouped_weighted_scatter_add_kernel(
     # This ensures we have enough threads to cover the largest expert.
     # Experts smaller than Max_Rows will have some idle threads (masked out below).
 
+    # [Trace: Block (1, 1)]
+    # row_in_expert = 1  (I am the 2nd worker for this expert)
+    # expert_id     = 1  (I am working for Expert 1)
+
     row_in_expert = tl.program_id(0)  # Row Index (0, 1, 2... for this expert)
     expert_id = tl.program_id(1)  # Expert Index (0..255) for 256 experts mimicing GIGACHAT 3 Ultra
 
@@ -100,6 +124,10 @@ def _grouped_weighted_scatter_add_kernel(
     # -----------------------------------------------------------
     # Since we launched a rectangular grid but data is ragged (experts have
     # different token counts), we must early-exit threads that are out of bounds.
+    # [Trace: Block (1, 1)]
+    # chunk_sizes[1] is 2.
+    # Is 1 >= 2? False. We stay alive.
+    # (Note: Block (2, 1) would read 2, fail check, and exit).
     n_rows = tl.load(chunk_sizes + expert_id)
     if row_in_expert >= n_rows:
         return
@@ -109,6 +137,10 @@ def _grouped_weighted_scatter_add_kernel(
     # -----------------------------------------------------------
     # Instead of assuming data is at 'Input + offset', we fetch the base pointer.
     # This is what allows us to skip 'torch.cat'.
+    # [Trace: Block (1, 1)]
+    # We need to find the data for the 2nd token of E1 (which is Token 7).
+    #
+    # 1. Fetch Base: ptr_table[1] -> 0xB000
 
     # Load raw 64-bit pointer from table
     base_addr_int = tl.load(ptr_table + expert_id)
@@ -117,23 +149,38 @@ def _grouped_weighted_scatter_add_kernel(
 
     # Calculate address for the specific row this thread is processing
     # Address = Base + (RowIndex * Stride)
+    #
+    # Calculate Offset: Row 1 * Stride(4096)
+    # src_row_ptr points directly to Token 7's data at 0xB000 + 4096.
     src_row_ptr = src_ptr_base + row_in_expert * HIDDEN_DIM
 
     # -----------------------------------------------------------
     # 4. Global Indexing Lookup
     # -----------------------------------------------------------
+    # We have the data, but where does it go?
+    #
     # We are processing the k-th token of Expert E.
     # But what is its global token ID? (0..BatchSize)
     # Global_ID = Offset_of_Expert_E + k
+
+    # [Trace: Block (1, 1)]
+    # 1. Global Offset for E1 is 3 (Size of E0).
     global_offset = tl.load(expert_offsets + expert_id)
+    # 2. Global ID = 3 + 1 = 4.
+    # Meaning: I am the 5th token in the packed sequence.
     global_row_id = global_offset + row_in_expert
 
     # Fetch the Scatter Index (Where do I write?)
+    # Look up Global Index #4
+    # idx_ptr[4] is 7.
     target_row_idx = tl.load(idx_ptr + global_row_id)
+
     # Fetch the Gating Weight (How much do I matter?)
+    # Look up Weight #4
     weight = tl.load(w_ptr + global_row_id)
 
     # Compute Output destination address
+    # Final Destination Address
     out_row_ptr = out_ptr + target_row_idx * stride_out_row
 
     # -----------------------------------------------------------
@@ -149,15 +196,18 @@ def _grouped_weighted_scatter_add_kernel(
         mask = cols < HIDDEN_DIM
 
         # A. LOAD: Coalesced read from the Expert's disjoint buffer
+        # Read directly from 0xB000 + 4096
         val = tl.load(src_row_ptr + cols, mask=mask)
 
         # B. COMPUTE: Fused multiply (saves a global Read/Write roundtrip)
+        # Fuse multiplication in registers
         weighted_val = val * weight
 
         # C. STORE: Atomic Add
         # Why Atomic? Because multiple experts (Top-K > 1) might route to
         # the same target token. A standard store would race condition.
-        # Atomic add happens in L2 cache on modern GPUs (very fast).
+        # Atomic add happens in L2 cache.
+        # Atomic Add to Final Output at Row 7.
         tl.atomic_add(out_row_ptr + cols, weighted_val, mask=mask)
 
 
@@ -250,8 +300,6 @@ class GroupedWeightedScatterAdd(torch.autograd.Function):
     def backward(ctx, grad_output):
         indices, weights = ctx.saved_tensors
         sizes = ctx.expert_sizes
-
-        # Backward Math:
         # Forward: Y[i] += X * w
         # Backward: dL/dX = dL/dY[i] * w
 
