@@ -343,14 +343,6 @@ def run_on_cloud():
         logger.warning("No CUDA detected. Skipping.")
         return
 
-    # Check for torchrun environment variables
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        # Torchrun
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        main_worker(rank, world_size)
-    else:
-        # Jupyter (mp.spawn)
-        world_size = torch.cuda.device_count()
-        logger.info(f"Running via mp.spawn on {world_size} GPUs...")
-        mp.spawn(main_worker, args=(world_size,), nprocs=world_size)
+    world_size = torch.cuda.device_count()
+    logger.info(f"Running via mp.spawn on {world_size} GPUs...")
+    mp.spawn(main_worker, args=(world_size,), nprocs=world_size)
