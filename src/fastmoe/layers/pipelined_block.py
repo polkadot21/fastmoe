@@ -68,7 +68,8 @@ class PipelinedMoEBlock(nn.Module):
                         self.simulated_network_latency_ms, self.manager.moe_stream
                     )
 
-                moe_out_1 = self.moe(moe_in_1)
+                # USE LANE 1 (Group 1)
+                moe_out_1 = self.moe(moe_in_1, group=self.manager.group_chunk1)
 
             # Signal: Output 1 is done
             self.manager.record_done()
@@ -80,9 +81,11 @@ class PipelinedMoEBlock(nn.Module):
         # -----------------------------------------------------------------
         # 4. MoE(2) [Main Stream] - Unblocked!
         # -----------------------------------------------------------------
-        # No waiting here. Parallelism happens now.
+        # USE LANE 2 (Group 2)
+        # Because we use a different NCCL Group, this call will NOT block
+        # waiting for MoE(1)'s All-To-All to finish.
         with record_function(f"Block {self.block_idx}: MoE(2) [Compute]"):
-            moe_out_2 = self.moe(moe_in_2)
+            moe_out_2 = self.moe(moe_in_2, group=self.manager.group_chunk2)
             x2_final = x2_mid + moe_out_2
 
         # -----------------------------------------------------------------

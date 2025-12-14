@@ -59,9 +59,14 @@ class MoEFeedForward(nn.Module):
 
         self.router = nn.Linear(dim, num_experts, bias=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, group=None) -> torch.Tensor:
         """
         Full Distributed MoE Forward Pass with Detailed Histogram Exchange.
+
+        Args:
+            x: Input tensor [B, T, D]
+            group: The NCCL ProcessGroup to use for communication.
+                   If None, uses the default global group.
         """
         B, T, D = x.shape
         x_flat = x.view(-1, D)
@@ -95,9 +100,8 @@ class MoEFeedForward(nn.Module):
         send_counts = expert_hist_per_rank.sum(dim=1).long()
 
         # D. Exchange Detailed Histograms
-        # Input:  My plans for others' experts.
-        # Output: Others' plans for MY local experts.
-        # recv_expert_hist[i][j] = "How many tokens Rank i is sending to MY local expert j"
+        # Note: We currently don't support custom 'group' for this metadata exchange
+        # in the Communicator interface yet, but metadata is tiny so blocking is negligible.
         recv_expert_hist = self.comm.exchange_expert_histogram(expert_hist_per_rank)
 
         # E. Calculate Recv Counts (Total per Rank) for the heavy payload
@@ -112,7 +116,10 @@ class MoEFeedForward(nn.Module):
 
         # Send data!
         # recv_data is ordered by Sending Rank: [From_Rank0 ... | From_Rank1 ...]
-        recv_data = self.comm.all_to_all(x_permuted, send_counts.tolist(), recv_counts.tolist())
+        # We pass the specific 'group' here to allow parallel transfers.
+        recv_data = self.all_to_all(
+            x_permuted, send_counts.tolist(), recv_counts.tolist(), group=group
+        )
 
         # ---------------------------------------------------------------------
         # 4. Computation (Experts)
@@ -169,9 +176,9 @@ class MoEFeedForward(nn.Module):
 
         final_out_buffer = torch.cat(to_send_back, dim=0)
 
-        # Reverse All-to-All
-        combined_output = self.comm.all_to_all(
-            final_out_buffer, recv_counts.tolist(), send_counts.tolist()
+        # Reverse All-to-All (Pass 'group' again!)
+        combined_output = self.all_to_all(
+            final_out_buffer, recv_counts.tolist(), send_counts.tolist(), group=group
         )
 
         # ---------------------------------------------------------------------
@@ -192,5 +199,34 @@ class MoEFeedForward(nn.Module):
         weights = weights.view(B, T, self.top_k, 1)
 
         output = (restored_x * weights).sum(dim=2)
+
+        return output
+
+    def all_to_all(self, x, send_counts, recv_counts, group=None):
+        """
+        Helper to handle the communication using specific process groups.
+        """
+        if self.world_size == 1:
+            return x
+
+        # Prepare output buffer based on recv_counts
+        total_recv = sum(recv_counts)
+        output = torch.empty(total_recv, x.size(1), device=x.device, dtype=x.dtype)
+
+        # We must use split/cat because dist.all_to_all_single expects list of tensors
+        # for inputs/outputs if using uneven splits (which is the case here).
+        # However, Pytorch's all_to_all_single handles flattened buffers with split_sizes.
+
+        input_split_sizes = send_counts
+        output_split_sizes = recv_counts
+
+        # Pytorch's dist.all_to_all_single signature:
+        dist.all_to_all_single(
+            output,
+            x,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+        )
 
         return output
