@@ -28,37 +28,31 @@ class PipelinedMoEBlock(nn.Module):
         x1, x2 = x.chunk(2, dim=0)
 
         # -----------------------------------------------------------------
-        # STEP 1: Main Stream - Compute Attn(1)
+        # 1. Submit Attn(1) [Main Stream]
         # -----------------------------------------------------------------
         with record_function(f"Block {self.block_idx}: Attn(1) [Compute]"):
             residual_1 = x1
             x1_mid = residual_1 + self.attn(self.norm1(x1))
             moe_in_1 = self.norm2(x1_mid)
 
-        # Signal that x1 is ready for the side stream
         self.moe_in_ready.record(torch.cuda.current_stream())
 
         # -----------------------------------------------------------------
-        # STEP 2: Main Stream - Compute Attn(2)  <-- MOVED UP!
+        # 2. Submit Attn(2) [Main Stream]
         # -----------------------------------------------------------------
-        # We submit this NOW so it sits in the GPU queue.
-        # Even if the CPU blocks later in step 3, the GPU already has this job!
         with record_function(f"Block {self.block_idx}: Attn(2) [Compute]"):
             residual_2 = x2
             x2_mid = residual_2 + self.attn(self.norm1(x2))
             moe_in_2 = self.norm2(x2_mid)
 
         # -----------------------------------------------------------------
-        # STEP 3: Side Stream - MoE(1) (Contains the CPU Block)
+        # 3. Launch MoE(1) [Side Stream]
         # -----------------------------------------------------------------
         with torch.cuda.stream(self.moe_stream):
             self.moe_stream.wait_event(self.moe_in_ready)
 
-            # This block contains .tolist() which pauses the CPU.
-            # But since Attn(2) is already submitted, the GPU will run it
-            # concurrently with this overhead!
             with record_function(f"Block {self.block_idx}: MoE(1) [OVERLAP]"):
-                # Optional: Inject delay here if using the simulation
+                # Optional: Network Simulation
                 if (
                     hasattr(self, "simulated_network_latency_ms")
                     and self.simulated_network_latency_ms > 0
@@ -73,13 +67,19 @@ class PipelinedMoEBlock(nn.Module):
             x1_final = x1_mid + moe_out_1
 
         # -----------------------------------------------------------------
-        # STEP 4: Join
+        # 4. Launch MoE(2) [Main Stream]
         # -----------------------------------------------------------------
-        torch.cuda.current_stream().wait_event(self.moe_out_done)
+        # Now MoE(2) starts immediately after Attn(2) finishes.
 
         with record_function(f"Block {self.block_idx}: MoE(2) [Compute]"):
             moe_out_2 = self.moe(moe_in_2)
             x2_final = x2_mid + moe_out_2
+
+        # -----------------------------------------------------------------
+        # 5. Join (Sync)
+        # -----------------------------------------------------------------
+        # We only wait right before we need to touch x1_final
+        torch.cuda.current_stream().wait_event(self.moe_out_done)
 
         return torch.cat([x1_final, x2_final], dim=0)
 
