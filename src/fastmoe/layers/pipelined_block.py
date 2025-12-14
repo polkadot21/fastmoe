@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.cuda import nvtx
 
 
 class PipelinedMoEBlock(nn.Module):
@@ -19,74 +20,61 @@ class PipelinedMoEBlock(nn.Module):
         super().__init__()
         self.attn = attn_layer
         self.moe = moe_layer
-
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
 
         self.use_streams = torch.cuda.is_available()
         if self.use_streams:
             self.moe_stream = torch.cuda.Stream()
-            # Event: Signals that Main Stream has finished preparing input for MoE
             self.moe_in_ready = torch.cuda.Event(enable_timing=False)
-            # Event: Signals that Side Stream has finished MoE computation
             self.moe_out_done = torch.cuda.Event(enable_timing=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
-        # Fallback for small batches or CPU
         if not self.use_streams or B < 2:
             return self._forward_sequential(x)
 
-        # 1. Split Batch
         x1, x2 = x.chunk(2, dim=0)
 
-        # =================================================================
-        # STAGE 1: Process Chunk 1 (Main Stream)
-        # =================================================================
-        # Compute Attn(B1) to get inputs ready for MoE
+        # --- STAGE 1: Main Stream (Attn Chunk 1) ---
+        nvtx.range_push("Stream 1: Attn(Chunk1)")  # Blue-ish default
         residual_1 = x1
         x1_mid = residual_1 + self.attn(self.norm1(x1))
         moe_in_1 = self.norm2(x1_mid)
+        nvtx.range_pop()
 
-        # [SYNC POINT A]
-        # Record that Main Stream is done with moe_in_1
+        # Signal that Chunk 1 is ready for MoE
         self.moe_in_ready.record(torch.cuda.current_stream())
 
-        # =================================================================
-        # STAGE 2: Overlap (Side Stream || Main Stream)
-        # =================================================================
+        # --- STAGE 2: Overlap ---
 
-        # --- SIDE STREAM (MoE Chunk 1) ---
+        # A. SIDE STREAM (MoE Chunk 1) - THE RED BAR
         with torch.cuda.stream(self.moe_stream):
-            # Wait until Main Stream has written moe_in_1
             self.moe_stream.wait_event(self.moe_in_ready)
 
-            # Heavy Comm + Compute
+            # Color 2 = Red (approx)
+            nvtx.range_push("Stream 2: MoE(Chunk1) [COMM]", color_id=2)
             moe_out_1 = self.moe(moe_in_1)
+            nvtx.range_pop()
 
-            # [SYNC POINT B]
-            # Record that Side Stream is finished
             self.moe_out_done.record(self.moe_stream)
-
-            # Combine residual for Chunk 1
             x1_final = x1_mid + moe_out_1
 
-        # --- MAIN STREAM (Attn Chunk 2) ---
-        # This runs simultaneously with the block above!
+        # B. MAIN STREAM (Attn Chunk 2) - THE BLUE BAR
+        # This should run PARALLEL to the block above
+        nvtx.range_push("Stream 1: Attn(Chunk2) [COMPUTE]", color_id=1)  # Green/Blue
         residual_2 = x2
         x2_mid = residual_2 + self.attn(self.norm1(x2))
         moe_in_2 = self.norm2(x2_mid)
+        nvtx.range_pop()
 
-        # =================================================================
-        # STAGE 3: Join
-        # =================================================================
-
-        # Finish Chunk 2 (Sequential Tail)
+        # --- STAGE 3: Join ---
+        nvtx.range_push("Stream 1: MoE(Chunk2)")
         moe_out_2 = self.moe(moe_in_2)
         x2_final = x2_mid + moe_out_2
+        nvtx.range_pop()
 
-        # [SYNC POINT C]
-        # We cannot merge until Side Stream is definitely done.
+        # Wait for Side Stream to finish
         torch.cuda.current_stream().wait_event(self.moe_out_done)
 
         return torch.cat([x1_final, x2_final], dim=0)
