@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from fastmoe import consts
 from fastmoe.layers.moe import MoEFeedForward
 from fastmoe.layers.pipelined_block import PipelinedMoEBlock
+from fastmoe.streams import MoEStreamManager  # <--- New Import
 
 
 class MultiheadSelfAttention(nn.Module):
@@ -72,31 +73,64 @@ class TinyModel(nn.Module):
         num_experts=4,
         implementation=consts.MoEImplementation.FAST,
         use_moe=True,
+        top_k=2,  # Added explicit arg for clarity
     ):
         super().__init__()
         self.inp = nn.Linear(in_dim, dim, bias=False)
         self.blocks = nn.ModuleList()
+        self.out = nn.Linear(dim, in_dim, bias=False)
+
+        # We hold the manager here, but init it lazily in .to()
+        self.stream_manager = None
 
         for i in range(n_layers):
             attn = MultiheadSelfAttention(dim, n_heads)
 
-            if use_moe:
+            # Support alternating or full MoE
+            layer_uses_moe = (
+                use_moe  # Simpler logic: if use_moe=True, all layers use it for this demo
+            )
+
+            if layer_uses_moe:
                 ff = MoEFeedForward(
-                    dim, ff_dim, num_experts=num_experts, implementation=implementation
+                    dim, ff_dim, num_experts=num_experts, top_k=top_k, implementation=implementation
                 )
             else:
                 ff = FeedForward(dim, ff_dim)
 
-            if use_moe and (
+            if layer_uses_moe and (
                 implementation == consts.MoEImplementation.FAST or implementation == "fast"
             ):
-                block = PipelinedMoEBlock(attn, ff, dim, block_idx=i)
+                # We pass manager=None for now. It will be injected in .to()
+                block = PipelinedMoEBlock(attn, ff, dim, manager=None, block_idx=i)
             else:
                 block = SequentialBlock(attn, ff, dim)
 
             self.blocks.append(block)
 
-        self.out = nn.Linear(dim, in_dim, bias=False)
+    def to(self, *args, **kwargs):
+        """
+        Override .to() to detect when the model moves to GPU.
+        When it does, we initialize the MoEStreamManager and inject it into all blocks.
+        """
+        super().to(*args, **kwargs)
+
+        # Check if we are now on a CUDA device
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            return self
+
+        if device.type == "cuda" and self.stream_manager is None:
+            self.stream_manager = MoEStreamManager(device)
+
+            count = 0
+            for block in self.blocks:
+                if isinstance(block, PipelinedMoEBlock):
+                    block.manager = self.stream_manager
+                    count += 1
+
+        return self
 
     def forward(self, x):
         x = self.inp(x)
