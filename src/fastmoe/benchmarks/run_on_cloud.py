@@ -6,6 +6,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.optim as optim
 from loguru import logger
+from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 from fastmoe import consts
 from fastmoe.config import MoEScale, MoESetup, get_config
@@ -98,80 +99,29 @@ def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps
 
 
 # -------------------------------------------------------------------------
-# 2. Trace Generation (The "Red Bar under Blue Bar" Proof)
+# 2. Training Loop (Realistic Load + Profiling)
 # -------------------------------------------------------------------------
 
 
-def generate_overlap_trace(cfg: MoESetup, rank: int = 0):
-    if rank == 0:
-        logger.info("=" * 60)
-        logger.info("TRACING: Generating 'moe_overlap_trace.json'...")
-        logger.info(f"Config: B={cfg.batch_size} | S={cfg.seq_len} | D={cfg.hidden_dim}")
-        logger.info("=" * 60)
-
-    device = torch.device(f"cuda:{rank}")
-
-    model = TinyModel(
-        in_dim=cfg.hidden_dim,
-        dim=cfg.hidden_dim,
-        n_heads=16,
-        ff_dim=cfg.hidden_dim * 4,
-        n_layers=2,
-        num_experts=cfg.num_experts,
-        implementation=consts.MoEImplementation.FAST,
-    ).to(device)
-
-    x = torch.randn(cfg.batch_size, cfg.seq_len, cfg.hidden_dim, device=device)
-
-    # Warmup
-    for _ in range(3):
-        _ = model(x)
-    torch.cuda.synchronize()
-
-    # We REMOVE 'on_trace_ready' so it doesn't auto-save.
-    # We keep the schedule so it knows when to record.
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-        # on_trace_ready=torch.profiler.tensorboard_trace_handler("./traces"), <--- DELETED
-        record_shapes=True,
-        profile_memory=False,
-        with_stack=True,
-    ) as p:
-        for i in range(5):
-            torch.cuda.nvtx.range_push(f"Step {i}")
-            _ = model(x)
-            torch.cuda.nvtx.range_pop()
-            p.step()
-
-    if rank == 0:
-        trace_path = "./traces/moe_overlap_trace.json"
-        p.export_chrome_trace(trace_path)
-        logger.success(f"Trace generated! Saved to: {trace_path}")
-
-
-# -------------------------------------------------------------------------
-# 3. Training Loop (Realistic Load)
-# -------------------------------------------------------------------------
-
-
-def run_training_experiment(implementation: str, cfg: MoESetup, rank: int):
+def run_training_experiment(
+    implementation: str, cfg: MoESetup, rank: int, trace_filename: str = None
+):
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     device = torch.device(f"cuda:{rank}")
 
+    # Use a heavier configuration for the training loop to emphasize compute
     model = TinyModel(
         in_dim=cfg.hidden_dim,
         dim=cfg.hidden_dim,
-        n_heads=16,
-        ff_dim=256,
+        n_heads=32,  # Heavy attention
+        ff_dim=cfg.hidden_dim * 4,  # Standard MLP ratio (4x)
         n_layers=2,
         num_experts=cfg.num_experts,
+        top_k=cfg.top_k,
         implementation=implementation,
+        use_moe=True,
     ).to(device)
 
     optimizer = optim.SGD(model.parameters(), lr=0.01)
@@ -184,6 +134,8 @@ def run_training_experiment(implementation: str, cfg: MoESetup, rank: int):
 
     if rank == 0:
         logger.info(f"Running {implementation.upper()} Training Loop...")
+        if trace_filename:
+            logger.info(f"Profiling enabled. Saving trace to ./traces/{trace_filename}")
 
     # Warmup
     for _ in range(5):
@@ -196,38 +148,67 @@ def run_training_experiment(implementation: str, cfg: MoESetup, rank: int):
         optimizer.zero_grad()
     torch.cuda.synchronize()
 
+    # --- Profiling Setup ---
+    prof = None
+    if trace_filename:
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=0, warmup=0, active=5, repeat=1),
+            record_shapes=True,
+            with_stack=True,
+            on_trace_ready=None,  # We export manually
+        )
+        prof.start()
+
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     torch.cuda.reset_peak_memory_stats()
 
+    steps = 10 if trace_filename else cfg.active_steps
+
     start_event.record()
-    for step in range(cfg.active_steps):
-        with torch.amp.autocast("cuda", dtype=amp_dtype):
-            y = model(x)
-            loss = ((y - target) ** 2).mean()
+    for step in range(steps):
+        # Giant Scope to measure the ENTIRE step cost (Python + GPU)
+        with record_function(f"Global Step {step} [{implementation.upper()}]"):
+            with record_function("Forward"):
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    y = model(x)
+                    loss = ((y - target) ** 2).mean()
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad()
+            with record_function("Backward"):
+                scaler.scale(loss).backward()
 
-        if rank == 0 and (step % 10 == 0 or step == cfg.active_steps - 1):
+            with record_function("Optimizer"):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+        if rank == 0 and not trace_filename and (step % 10 == 0 or step == steps - 1):
             curr_mem = torch.cuda.memory_allocated() / (1024**3)
             logger.info(f"Step {step:03d} | Loss: {loss.item():.4f} | Mem: {curr_mem:.2f} GB")
+
+        if prof:
+            prof.step()
 
     end_event.record()
     torch.cuda.synchronize()
 
-    avg_time = start_event.elapsed_time(end_event) / cfg.active_steps
+    if prof:
+        prof.stop()
+        if rank == 0:
+            prof.export_chrome_trace(f"./traces/{trace_filename}")
+            logger.success(f"Trace saved: ./traces/{trace_filename}")
+
+    avg_time = start_event.elapsed_time(end_event) / steps
     peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
 
     return avg_time, peak_mem
 
 
 # -------------------------------------------------------------------------
-# 4. Main Worker (Called by either torchrun or mp.spawn)
+# 3. Main Worker (Called by either torchrun or mp.spawn)
 # -------------------------------------------------------------------------
 
 
@@ -237,14 +218,9 @@ def main_worker(rank, world_size):
     rank: Global rank of the process (0..N-1).
     world_size: Total number of GPUs.
     """
-    # If run via mp.spawn, we must manually set env vars for init_process_group
     if os.environ.get("MASTER_ADDR") is None:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "12355"
-
-    # init_app will handle dist.init_process_group logic safely
-    # For mp.spawn, we need to manually pass rank/world_size to it via env vars
-    # if we want it to pick them up, or simpler: just init here if using spawn.
 
     if not dist.is_initialized():
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -256,10 +232,9 @@ def main_worker(rank, world_size):
     if rank == 0:
         logger.info(f"Target: {cfg.scale.value.upper()} | Experts: {cfg.num_experts}")
 
-    # --- PART 1: KERNEL BENCHMARK (Only on Rank 0 usually, but we run on all) ---
+    # --- PART 1: KERNEL BENCHMARK ---
     device = torch.device(f"cuda:{rank}")
 
-    # We allocate inputs on all ranks to simulate load, but log only on Rank 0
     total_tokens = cfg.total_tokens
     chunk_size = total_tokens // cfg.num_experts
 
@@ -272,7 +247,6 @@ def main_worker(rank, world_size):
 
     base_mem = torch.cuda.memory_allocated() / (1024**2)
 
-    # Run verification
     if rank == 0:
         verify_correctness(expert_outputs, indices, weights, out_shape)
         logger.info("Benchmarking Kernel...")
@@ -295,21 +269,19 @@ def main_worker(rank, world_size):
         logger.info(f"Mem Overhead: Std={std_overhead:.0f}MB | Fast={fast_overhead:.0f}MB")
         logger.info("-" * 60)
 
-    # Cleanup
     del expert_outputs, indices, weights
     torch.cuda.empty_cache()
 
-    # --- PART 2: OVERLAP TRACE ---
-    # We run this on all ranks, but only Rank 0 exports the JSON
-    generate_overlap_trace(cfg, rank)
-
-    # --- PART 3: TRAINING BENCHMARK ---
+    # --- PART 2: TRAINING BENCHMARK + TRACING ---
     if rank == 0:
         logger.info("=" * 60)
-        logger.info(f"TRAINING BENCHMARK | {TARGET_SCALE.value.upper()}")
+        logger.info(f"TRAINING BENCHMARK & PROFILING | {TARGET_SCALE.value.upper()}")
 
+    # 1. Profile STANDARD
     try:
-        std_time, std_mem = run_training_experiment(consts.MoEImplementation.STANDARD, cfg, rank)
+        std_time, std_mem = run_training_experiment(
+            consts.MoEImplementation.STANDARD, cfg, rank, trace_filename="trace_standard.json"
+        )
         if rank == 0:
             logger.info(f"Standard: {std_time:.2f} ms/step | Peak Mem: {std_mem:.2f} GB")
     except torch.cuda.OutOfMemoryError:
@@ -317,7 +289,10 @@ def main_worker(rank, world_size):
             logger.error("Standard: OOM!")
         std_time, std_mem = float("inf"), float("inf")
 
-    fast_time, fast_mem = run_training_experiment(consts.MoEImplementation.FAST, cfg, rank)
+    # 2. Profile FAST
+    fast_time, fast_mem = run_training_experiment(
+        consts.MoEImplementation.FAST, cfg, rank, trace_filename="trace_fast.json"
+    )
 
     if rank == 0:
         logger.info(f"FastMoE:  {fast_time:.2f} ms/step | Peak Mem: {fast_mem:.2f} GB")
@@ -329,7 +304,7 @@ def main_worker(rank, world_size):
 
 
 # -------------------------------------------------------------------------
-# 5. Entry Point
+# 4. Entry Point
 # -------------------------------------------------------------------------
 
 
