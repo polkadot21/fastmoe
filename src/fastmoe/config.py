@@ -71,7 +71,7 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
         # Moderate Seq Len = Safety from OOM.
         return MoESetup(
             scale=MoEScale.TRACE_OPTIMIZED,
-            batch_size=64,
+            batch_size=32,
             seq_len=512,
             hidden_dim=8192,  # Standard Llama-7B width. Heavy matrices.
             num_experts=8,  # 4 experts per GPU
