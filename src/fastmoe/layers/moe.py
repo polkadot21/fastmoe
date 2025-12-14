@@ -187,7 +187,9 @@ class MoEFeedForward(nn.Module):
 
         # Weighted Sum
         restored_x = restored_x.view(B, T, self.top_k, D)
-        weights = weights.unsqueeze(-1)
+
+        # Reshape weights from [B*T, K] to [B, T, K, 1] so it broadcasts correctly
+        weights = weights.view(B, T, self.top_k, 1)
 
         output = (restored_x * weights).sum(dim=2)
 
