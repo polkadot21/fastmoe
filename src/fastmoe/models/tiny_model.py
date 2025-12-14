@@ -77,7 +77,7 @@ class TinyModel(nn.Module):
         self.inp = nn.Linear(in_dim, dim, bias=False)
         self.blocks = nn.ModuleList()
 
-        for _ in range(n_layers):
+        for i in range(n_layers):
             attn = MultiheadSelfAttention(dim, n_heads)
 
             if use_moe:
@@ -90,7 +90,7 @@ class TinyModel(nn.Module):
             if use_moe and (
                 implementation == consts.MoEImplementation.FAST or implementation == "fast"
             ):
-                block = PipelinedMoEBlock(attn, ff, dim)
+                block = PipelinedMoEBlock(attn, ff, dim, block_idx=i)
             else:
                 block = SequentialBlock(attn, ff, dim)
 
