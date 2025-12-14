@@ -1,7 +1,10 @@
 import functools
+import os
 import sys
 from enum import Enum
 
+import torch
+import torch.distributed as dist
 from loguru import logger
 from pydantic_settings import BaseSettings
 
@@ -10,6 +13,7 @@ class MoEScale(str, Enum):
     DEBUG = "debug"
     GIGACHAT_10B = "gigachat-10b"
     GIGACHAT_700B = "gigachat-700b"
+    TRACE_OPTIMIZED = "trace-optimized"
 
 
 class MoESetup(BaseSettings):
@@ -60,6 +64,20 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
             scale=MoEScale.DEBUG, batch_size=2, seq_len=128, hidden_dim=512, num_experts=4, top_k=2
         )
 
+    elif scale == MoEScale.TRACE_OPTIMIZED:
+        # Designed for 2 GPUs to show perfect overlap.
+        # High Hidden Dim = Heavy Math.
+        # High Batch = Heavy Payload.
+        # Moderate Seq Len = Safety from OOM.
+        return MoESetup(
+            scale=MoEScale.TRACE_OPTIMIZED,
+            batch_size=8,  # Large enough to split into micro-batches (4+4)
+            seq_len=1024,  # Long enough for attention to take
+            hidden_dim=4096,  # Standard Llama-7B width. Heavy matrices.
+            num_experts=8,  # 4 experts per GPU
+            top_k=2,
+        )
+
     elif scale == MoEScale.GIGACHAT_10B:
         # Configuration roughly matching Mixtral 8x7B or similar mid-sized MoE
         return MoESetup(
@@ -88,11 +106,41 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
 
 @functools.lru_cache
 def init_app() -> Config:
+    # 1. Load Configuration
     cfg = Config()
+
+    # 2. Configure Logging
     logger.remove()
     logger.add(
         sys.stderr,
         level=cfg.log_level,
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",  # noqa
     )
+
+    # 3. Initialize Distributed Environment (The new part)
+    # torchrun sets these variables automatically
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        try:
+            # NCCL is standard for GPUs, Gloo for CPU tests
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+
+            dist.init_process_group(backend=backend)
+
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
+
+            rank = dist.get_rank()
+            if rank == 0:
+                logger.info(
+                    f"Distributed Init: Success. Backend={backend}, World={dist.get_world_size()}"
+                )
+        except Exception as e:
+            logger.error(f"Distributed Init Failed: {e}")
+            raise e
+    else:
+        logger.info(
+            "No distributed environment detected (RANK/WORLD_SIZE missing). Running in single-process mode."  # noqa
+        )
+
     return cfg

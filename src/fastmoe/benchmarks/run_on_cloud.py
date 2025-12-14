@@ -1,26 +1,34 @@
 import gc
+import os
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.optim as optim
 from loguru import logger
 
 from fastmoe import consts
-from fastmoe.config import MoEScale, MoESetup, get_config, init_app
+from fastmoe.config import MoEScale, MoESetup, get_config
 from fastmoe.kernels.ops import grouped_weighted_scatter_add, prepare_grouped_metadata
 from fastmoe.models.tiny_model import TinyModel
 
+# -------------------------------------------------------------------------
+# 1. Verification & Micro-Benchmarks (Kernel Logic)
+# -------------------------------------------------------------------------
+
 
 def verify_correctness(expert_outputs, indices, weights, out_shape):
+    """Verifies that the custom kernel matches standard PyTorch math."""
     logger.info("Verifying numerical correctness...")
     device = expert_outputs[0].device
 
-    # 1. Standard
+    # A. Standard (Cat -> IndexAdd)
     combined = torch.cat(expert_outputs, dim=0)
     weighted = combined * weights.unsqueeze(-1)
     out_std = torch.zeros(out_shape, device=device)
     out_std.index_add_(0, indices, weighted)
 
-    # 2. FastMoE (Grouped)
+    # B. FastMoE (Grouped Kernel)
     out_fast = torch.zeros(out_shape, device=device)
     grouped_weighted_scatter_add(expert_outputs, indices, weights, out_shape, out=out_fast)
 
@@ -35,7 +43,6 @@ def verify_correctness(expert_outputs, indices, weights, out_shape):
 
 
 def benchmark_standard(expert_outputs, indices, weights, out_shape, steps):
-    """Standard: Cat -> Weight -> IndexAdd"""
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
@@ -56,34 +63,26 @@ def benchmark_standard(expert_outputs, indices, weights, out_shape, steps):
 
 
 def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps):
-    """
-    FastMoE: Grouped Kernel + CUDA Graphs.
-    """
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     device = expert_outputs[0].device
 
     out_static = torch.zeros(out_shape, device=device)
-
-    # --- 1. PREPARE METADATA (Static Graph Setup) ---
     metadata = prepare_grouped_metadata(expert_outputs, device)
 
-    # Warmup
+    # Warmup & Graph Capture
     grouped_weighted_scatter_add(
         expert_outputs, indices, weights, out_shape, out=out_static, metadata=metadata
     )
     torch.cuda.synchronize()
 
-    # --- 2. CAPTURE GRAPH ---
     g = torch.cuda.CUDAGraph()
     out_static.zero_()
-
     with torch.cuda.graph(g):
         grouped_weighted_scatter_add(
             expert_outputs, indices, weights, out_shape, out=out_static, metadata=metadata
         )
 
-    # --- 3. REPLAY ---
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
@@ -98,18 +97,75 @@ def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps
     return start_event.elapsed_time(end_event) / steps, peak_mem
 
 
-def run_training_experiment(implementation: str, cfg: MoESetup):
-    """
-    Runs a realistic training loop for N steps using AMP (Automatic Mixed Precision).
-    """
+# -------------------------------------------------------------------------
+# 2. Trace Generation (The "Red Bar under Blue Bar" Proof)
+# -------------------------------------------------------------------------
+
+
+def generate_overlap_trace(cfg: MoESetup, rank: int = 0):
+    if rank == 0:
+        logger.info("=" * 60)
+        logger.info("TRACING: Generating 'moe_overlap_trace.json'...")
+        logger.info(f"Config: B={cfg.batch_size} | S={cfg.seq_len} | D={cfg.hidden_dim}")
+        logger.info("=" * 60)
+
+    device = torch.device(f"cuda:{rank}")
+
+    # Force 'FAST' implementation
+    model = TinyModel(
+        in_dim=cfg.hidden_dim,
+        dim=cfg.hidden_dim,
+        n_heads=16,  # Standard head count
+        ff_dim=cfg.hidden_dim * 4,  # Standard MLP ratio
+        n_layers=2,  # Keep depth low, we only care about horizontal overlap
+        num_experts=cfg.num_experts,
+        implementation=consts.MoEImplementation.FAST,
+    ).to(device)
+
+    # Use Config dimensions!
+    # This ensures we hit the "Goldilocks" zone defined in TRACE_OPTIMIZED
+    x = torch.randn(cfg.batch_size, cfg.seq_len, cfg.hidden_dim, device=device)
+
+    # Warmup
+    for _ in range(3):
+        _ = model(x)
+    torch.cuda.synchronize()
+
+    # Profiler
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("./traces"),
+        record_shapes=True,
+        profile_memory=False,  # Disable memory profiling to reduce overhead
+        with_stack=True,
+    ) as p:
+        for i in range(5):
+            torch.cuda.nvtx.range_push(f"Step {i}")
+            _ = model(x)
+            torch.cuda.nvtx.range_pop()
+            p.step()
+
+    if rank == 0:
+        trace_path = "./traces/moe_overlap_trace.json"
+        p.export_chrome_trace(trace_path)
+        logger.success(f"Trace generated! Saved to: {trace_path}")
+
+
+# -------------------------------------------------------------------------
+# 3. Training Loop (Realistic Load)
+# -------------------------------------------------------------------------
+
+
+def run_training_experiment(implementation: str, cfg: MoESetup, rank: int):
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
+    device = torch.device(f"cuda:{rank}")
 
-    device = torch.device("cuda")
-
-    # 1. Initialize Model
-    # FF_DIM=256 reduces weight memory, but DIM=16384 keeps activation memory massive.
     model = TinyModel(
         in_dim=cfg.hidden_dim,
         dim=cfg.hidden_dim,
@@ -120,38 +176,30 @@ def run_training_experiment(implementation: str, cfg: MoESetup):
         implementation=implementation,
     ).to(device)
 
-    optimizer = optim.SGD(model.parameters(), lr=0.5)
-
-    # We use GradScaler just in case we fall back to float16, though BF16 doesn't strictly need it.
+    optimizer = optim.SGD(model.parameters(), lr=0.01)
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
 
-    logger.info(f"AMP Enabled: {amp_dtype}")
-
-    # Dummy Data
     B, T, D = cfg.batch_size, cfg.seq_len, cfg.hidden_dim
     x = torch.randn(B, T, D, device=device)
     target = x.clone()
 
-    logger.info(f"Running {implementation.upper()} Training Loop...")
+    if rank == 0:
+        logger.info(f"Running {implementation.upper()} Training Loop...")
 
-    # 3. Warmup
+    # Warmup
     for _ in range(5):
         with torch.amp.autocast("cuda", dtype=amp_dtype):
             y = model(x)
             loss = ((y - target) ** 2).mean()
-
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
-
     torch.cuda.synchronize()
 
-    # 4. Profile
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-
     torch.cuda.reset_peak_memory_stats()
 
     start_event.record()
@@ -161,25 +209,15 @@ def run_training_experiment(implementation: str, cfg: MoESetup):
             loss = ((y - target) ** 2).mean()
 
         scaler.scale(loss).backward()
-        if step % 10 == 0:
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    total_norm += p.grad.data.norm(2).item()
-
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
 
-        if step % 10 == 0 or step == cfg.active_steps - 1:
-            loss_val = loss.item()
+        if rank == 0 and (step % 10 == 0 or step == cfg.active_steps - 1):
             curr_mem = torch.cuda.memory_allocated() / (1024**3)
-            # Log Grad Norm too
-            logger.info(
-                f"Step {step:03d}/{cfg.active_steps} | Loss: {loss_val:.4f} | GradNorm: {total_norm:.4f} | Mem: {curr_mem:.2f} GB"  # noqa
-            )
+            logger.info(f"Step {step:03d} | Loss: {loss.item():.4f} | Mem: {curr_mem:.2f} GB")
 
     end_event.record()
     torch.cuda.synchronize()
@@ -187,25 +225,46 @@ def run_training_experiment(implementation: str, cfg: MoESetup):
     avg_time = start_event.elapsed_time(end_event) / cfg.active_steps
     peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
 
-    # Cleanup
-    del model, optimizer, x, target
     return avg_time, peak_mem
 
 
-def run_on_cloud():
-    init_app()
-    TARGET_SCALE = MoEScale.GIGACHAT_700B
+# -------------------------------------------------------------------------
+# 4. Main Worker (Called by either torchrun or mp.spawn)
+# -------------------------------------------------------------------------
+
+
+def main_worker(rank, world_size):
+    """
+    The actual entry point for the process.
+    rank: Global rank of the process (0..N-1).
+    world_size: Total number of GPUs.
+    """
+    # If run via mp.spawn, we must manually set env vars for init_process_group
+    if os.environ.get("MASTER_ADDR") is None:
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "12355"
+
+    # init_app will handle dist.init_process_group logic safely
+    # For mp.spawn, we need to manually pass rank/world_size to it via env vars
+    # if we want it to pick them up, or simpler: just init here if using spawn.
+
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+
+    TARGET_SCALE = MoEScale.TRACE_OPTIMIZED
     cfg = get_config(TARGET_SCALE)
 
-    if not torch.cuda.is_available():
-        return
+    if rank == 0:
+        logger.info(f"Target: {cfg.scale.value.upper()} | Experts: {cfg.num_experts}")
 
-    device = torch.device("cuda")
-    logger.info(f"Target: {cfg.scale.value.upper()} | Experts: {cfg.num_experts}")
+    # --- PART 1: KERNEL BENCHMARK (Only on Rank 0 usually, but we run on all) ---
+    device = torch.device(f"cuda:{rank}")
 
-    # --- PART 1: KERNEL BENCHMARK ---
+    # We allocate inputs on all ranks to simulate load, but log only on Rank 0
     total_tokens = cfg.total_tokens
     chunk_size = total_tokens // cfg.num_experts
+
     expert_outputs = [
         torch.randn(chunk_size, cfg.hidden_dim, device=device) for _ in range(cfg.num_experts)
     ]
@@ -215,59 +274,83 @@ def run_on_cloud():
 
     base_mem = torch.cuda.memory_allocated() / (1024**2)
 
-    verify_correctness(expert_outputs, indices, weights, out_shape)
+    # Run verification
+    if rank == 0:
+        verify_correctness(expert_outputs, indices, weights, out_shape)
+        logger.info("Benchmarking Kernel...")
 
-    logger.info("Benchmarking Kernel...")
-    std_ms, std_mem = benchmark_standard(
-        expert_outputs, indices, weights, out_shape, cfg.active_steps
-    )
-    fast_ms, fast_mem = benchmark_fastmoe_grouped(
-        expert_outputs, indices, weights, out_shape, cfg.active_steps
-    )
+    std_ms, std_mem = benchmark_standard(expert_outputs, indices, weights, out_shape, 10)
+    fast_ms, fast_mem = benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, 10)
 
-    logger.info("=" * 60)
-    logger.info(f"KERNEL RESULTS | {cfg.scale.value.upper()}")
-    logger.info(f"{'Metric':<15} | {'Standard':<12} | {'FastMoE':<12} | {'Delta':<10}")
-    logger.info("-" * 60)
-    logger.info(
-        f"{'Latency (ms)':<15} | {std_ms:<12.3f} | {fast_ms:<12.3f} | {std_ms / fast_ms:.2f}x Faster"  # noqa
-    )
+    if rank == 0:
+        std_overhead = std_mem - base_mem
+        fast_overhead = fast_mem - base_mem
+        if fast_overhead < 0.1:
+            fast_overhead = 0.1
 
-    std_overhead = std_mem - base_mem
-    fast_overhead = fast_mem - base_mem
-    if fast_overhead < 1:
-        fast_overhead = 1
-    logger.info(
-        f"{'Peak Mem (MB)':<15} | {std_mem:<12.0f} | {fast_mem:<12.0f} | {std_overhead / fast_overhead:.2f}x Less Ovhd"  # noqa
-    )
-    logger.info("=" * 60)
+        logger.info("-" * 60)
+        logger.info("KERNEL RESULTS (Latency & Memory Overhead)")
+        logger.info("-" * 60)
+        logger.info(
+            f"Latency: Std={std_ms:.2f}ms | Fast={fast_ms:.2f}ms | Speedup={std_ms / fast_ms:.2f}x"
+        )
+        logger.info(f"Mem Overhead: Std={std_overhead:.0f}MB | Fast={fast_overhead:.0f}MB")
+        logger.info("-" * 60)
 
+    # Cleanup
     del expert_outputs, indices, weights
     torch.cuda.empty_cache()
 
-    # --- PART 2: TRAINING BENCHMARK ---
-    logger.info("=" * 60)
-    logger.info(f"TRAINING BENCHMARK | {TARGET_SCALE.value.upper()}")
-    logger.info(f"Experts: {cfg.num_experts} | Hidden: {cfg.hidden_dim} | Seq: {cfg.seq_len}")
-    logger.info("=" * 60)
+    # --- PART 2: OVERLAP TRACE ---
+    # We run this on all ranks, but only Rank 0 exports the JSON
+    generate_overlap_trace(cfg, rank)
 
-    # 1. Run Standard
+    # --- PART 3: TRAINING BENCHMARK ---
+    if rank == 0:
+        logger.info("=" * 60)
+        logger.info(f"TRAINING BENCHMARK | {TARGET_SCALE.value.upper()}")
+
     try:
-        std_time, std_mem = run_training_experiment(consts.MoEImplementation.STANDARD, cfg)
-        logger.info(f"Standard: {std_time:.2f} ms/step | Peak Mem: {std_mem:.2f} GB")
+        std_time, std_mem = run_training_experiment(consts.MoEImplementation.STANDARD, cfg, rank)
+        if rank == 0:
+            logger.info(f"Standard: {std_time:.2f} ms/step | Peak Mem: {std_mem:.2f} GB")
     except torch.cuda.OutOfMemoryError:
-        logger.error("Standard: OOM (Out Of Memory)!")
+        if rank == 0:
+            logger.error("Standard: OOM!")
         std_time, std_mem = float("inf"), float("inf")
 
-    # 2. Run FastMoE
-    fast_time, fast_mem = run_training_experiment(consts.MoEImplementation.FAST, cfg)
-    logger.info(f"FastMoE:  {fast_time:.2f} ms/step | Peak Mem: {fast_mem:.2f} GB")
+    fast_time, fast_mem = run_training_experiment(consts.MoEImplementation.FAST, cfg, rank)
 
-    # 3. Comparison
-    logger.info("-" * 60)
-    if std_time != float("inf"):
-        logger.success(f"Speedup: {std_time / fast_time:.2f}x")
-        logger.success(f"Memory Reduction: {std_mem - fast_mem:.2f} GB Saved")
+    if rank == 0:
+        logger.info(f"FastMoE:  {fast_time:.2f} ms/step | Peak Mem: {fast_mem:.2f} GB")
+        if std_time != float("inf"):
+            logger.success(f"Final Speedup: {std_time / fast_time:.2f}x")
+            logger.success(f"Memory Saved: {std_mem - fast_mem:.2f} GB")
+
+    dist.destroy_process_group()
+
+
+# -------------------------------------------------------------------------
+# 5. Entry Point
+# -------------------------------------------------------------------------
+
+
+def run_on_cloud():
+    """
+    Entry point. Detects if running via torchrun or needs mp.spawn.
+    """
+    if not torch.cuda.is_available():
+        logger.warning("No CUDA detected. Skipping.")
+        return
+
+    # Check for torchrun environment variables
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        # Torchrun
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        main_worker(rank, world_size)
     else:
-        logger.success("FastMoE enabled training where Standard failed (OOM).")
-    logger.info("-" * 60)
+        # Jupyter (mp.spawn)
+        world_size = torch.cuda.device_count()
+        logger.info(f"Running via mp.spawn on {world_size} GPUs...")
+        mp.spawn(main_worker, args=(world_size,), nprocs=world_size)

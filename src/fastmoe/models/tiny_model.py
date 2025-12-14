@@ -3,9 +3,9 @@ import torch.nn.functional as F
 
 from fastmoe import consts
 from fastmoe.layers.moe import MoEFeedForward
+from fastmoe.layers.pipelined_block import PipelinedMoEBlock
 
 
-# [Exact Copy of MultiheadSelfAttention from your provided snippet]
 class MultiheadSelfAttention(nn.Module):
     def __init__(self, dim, n_heads):
         super().__init__()
@@ -30,7 +30,6 @@ class MultiheadSelfAttention(nn.Module):
         return self.proj(out)
 
 
-# [Standard FF kept for reference/hybrid models]
 class FeedForward(nn.Module):
     def __init__(self, dim, ff_dim):
         super().__init__()
@@ -41,27 +40,20 @@ class FeedForward(nn.Module):
         return self.fc2(F.gelu(self.fc1(x)))
 
 
-class Block(nn.Module):
-    def __init__(
-        self,
-        dim,
-        n_heads,
-        ff_dim,
-        use_moe=True,
-        num_experts=4,
-        implementation=consts.MoEImplementation.FAST,
-    ):
+class SequentialBlock(nn.Module):
+    """
+    Standard sequential execution:
+    1. Attention
+    2. MoE (or FF)
+    No overlap.
+    """
+
+    def __init__(self, attn_layer, ff_layer, dim):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiheadSelfAttention(dim, n_heads)
+        self.attn = attn_layer
         self.norm2 = nn.LayerNorm(dim)
-
-        if use_moe:
-            self.ff = MoEFeedForward(
-                dim, ff_dim, num_experts=num_experts, implementation=implementation
-            )
-        else:
-            self.ff = FeedForward(dim, ff_dim)
+        self.ff = ff_layer
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
@@ -78,23 +70,32 @@ class TinyModel(nn.Module):
         ff_dim=2048,
         n_layers=4,
         num_experts=4,
-        implementation="fast",
+        implementation=consts.MoEImplementation.FAST,
+        use_moe=True,
     ):
         super().__init__()
         self.inp = nn.Linear(in_dim, dim, bias=False)
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    dim,
-                    n_heads,
-                    ff_dim,
-                    use_moe=True,
-                    num_experts=num_experts,
-                    implementation=implementation,
+        self.blocks = nn.ModuleList()
+
+        for _ in range(n_layers):
+            attn = MultiheadSelfAttention(dim, n_heads)
+
+            if use_moe:
+                ff = MoEFeedForward(
+                    dim, ff_dim, num_experts=num_experts, implementation=implementation
                 )
-                for _ in range(n_layers)
-            ]
-        )
+            else:
+                ff = FeedForward(dim, ff_dim)
+
+            if use_moe and (
+                implementation == consts.MoEImplementation.FAST or implementation == "fast"
+            ):
+                block = PipelinedMoEBlock(attn, ff, dim)
+            else:
+                block = SequentialBlock(attn, ff, dim)
+
+            self.blocks.append(block)
+
         self.out = nn.Linear(dim, in_dim, bias=False)
 
     def forward(self, x):

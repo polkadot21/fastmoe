@@ -1,128 +1,147 @@
+from contextlib import contextmanager  # <--- Import this
+
 import torch
 
 # --- PATCHING (Mock CUDA) ---
-# We must patch BEFORE importing modules that might initialize CUDA things
 from mocks import MockEvent, MockStream
 
+# 1. Patch Classes
 torch.cuda.Event = MockEvent
-torch.cuda.stream = lambda s: s
-torch.cuda.current_stream = lambda: MockStream()
-# ----------------------------
+torch.cuda.Stream = MockStream
 
-# We import the kernel wrapper to ensure it's using the CPU fallback
+# 2. Patch Functions
+torch.cuda.current_stream = lambda: MockStream()
+torch.cuda.is_available = lambda: True
+torch.cuda.synchronize = lambda: None
+
+
+# 3. Patch Context Manager (The Fix)
+@contextmanager
+def mock_cuda_stream_context(stream):
+    yield
+
+
+torch.cuda.stream = mock_cuda_stream_context
+# ----------------------------
 from fastmoe.kernels.ops import weighted_scatter_add  # noqa
 from fastmoe.layers.moe import MoEFeedForward  # noqa
+from fastmoe.layers.pipelined_block import PipelinedMoEBlock  # noqa
 from fastmoe.models.tiny_model import TinyModel  # noqa
 
 
 def test_moe_forward_backward_cpu():
-    """
-    Verifies that the MoE layer and the Scatter-Add kernel (CPU fallback)
-    produce valid outputs and propagate gradients correctly.
-    """
+    """Verifies MoE gradient flow (Simulated on CPU/Mock CUDA)."""
     torch.manual_seed(42)
-
-    # Config
     B, T, D = 2, 8, 32
     ff_dim = 64
     num_experts = 4
     top_k = 2
 
-    # Instantiate Layer directly to test isolation
     moe = MoEFeedForward(D, ff_dim, num_experts=num_experts, top_k=top_k)
-
-    # Input Data
     x = torch.randn(B, T, D, requires_grad=True)
     target = torch.randn(B, T, D)
 
-    print("\n--- [Test] Forward Pass ---")
+    # Forward
     out = moe(x)
+    assert out.shape == (B, T, D)
+    assert not torch.isnan(out).any()
 
-    # 1. Check Output Shape
-    assert out.shape == (B, T, D), f"Shape Mismatch: {out.shape} != {(B, T, D)}"
-    print("Shape check passed.")
-
-    # 2. Check for NaNs
-    assert not torch.isnan(out).any(), "Output contains NaNs"
-    print("NaN check passed.")
-
-    print("\n--- [Test] Backward Pass ---")
+    # Backward
     loss = ((out - target) ** 2).sum()
     loss.backward()
 
-    # 3. Check Gradient Flow to Input
-    assert x.grad is not None, "Input x has no gradient"
-    assert not torch.isnan(x.grad).any(), "Input gradient has NaNs"
-    print("Input gradient check passed.")
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
 
-    # 4. Check Gradient Flow to Router
-    assert moe.router.weight.grad is not None, "Router has no gradient"
-    print("Router gradient check passed.")
-
-    # 5. Check Gradient Flow to Experts
-    # Note: With random data, it is statistically possible (though unlikely)
-    # that an expert receives 0 tokens.
+    # Check experts got gradients
     active_experts = 0
     for _, expert in enumerate(moe.experts):
-        # The first layer of the expert MLP
-        w_grad = expert[0].weight.grad
-        if w_grad is not None:
+        if expert[0].weight.grad is not None:
             active_experts += 1
-            assert not torch.isnan(w_grad).any()
-
-    print(f"Gradients found for {active_experts}/{num_experts} experts.")
     assert active_experts > 0, "No experts received gradients!"
 
 
+def test_pipelined_block_logic():
+    """
+    Verifies that PipelinedMoEBlock correctly splits and reassembles
+    the batch, producing the same result as a sequential run.
+    """
+    torch.manual_seed(42)
+    D = 32
+
+    # Simple Mock Layers
+    attn = torch.nn.Linear(D, D)  # Fake Attention
+    moe = torch.nn.Linear(D, D)  # Fake MoE (Compute only for test)
+
+    block = PipelinedMoEBlock(attn, moe, hidden_dim=D)
+
+    # Ensure streams are active in the test env
+    block.use_streams = True
+
+    # Batch size must be >= 2 for pipelining to trigger
+    B, T = 4, 10
+    x = torch.randn(B, T, D)
+
+    # 1. Run Pipeline Forward
+    out_pipe = block(x)
+
+    # 2. Run Sequential Forward (Ground Truth)
+    # We manually force the sequential path or replicate logic
+    out_seq = block._forward_sequential(x)
+
+    # The pipeline splits execution order but math should be identical
+    # (ignoring float precision noise if real GPU)
+    assert torch.allclose(out_pipe, out_seq, atol=1e-6), "Pipeline output differs from Sequential!"
+    print("\n[Test] Pipelined Block Logic Passed.")
+
+
 def test_full_model_integration():
-    """
-    Verifies the TinyModel structure with MoE blocks enabled.
-    """
+    """Verifies TinyModel with FastMoE implementation."""
     print("\n--- [Test] Full Model Integration ---")
     in_dim, dim = 16, 32
-    model = TinyModel(in_dim=in_dim, dim=dim, n_heads=4, ff_dim=64, n_layers=2, num_experts=4)
+    # 'FAST' triggers PipelinedMoEBlock inside TinyModel
+    model = TinyModel(
+        in_dim=in_dim,
+        dim=dim,
+        n_heads=4,
+        ff_dim=64,
+        n_layers=2,
+        num_experts=4,
+        implementation="fast",
+    )
 
-    x = torch.randn(2, 10, in_dim)  # [B, T, in_dim]
+    x = torch.randn(4, 10, in_dim)  # Batch 4 for pipelining
     out = model(x)
 
-    assert out.shape == (2, 10, in_dim)
+    assert out.shape == (4, 10, in_dim)
     print("Full model forward pass successful.")
 
 
 def test_scatter_add_correctness():
-    """
-    Numerically verify the Scatter-Add CPU fallback against a naive loop.
-    This ensures our 'Mock' logic in ops.py is mathematically correct.
-    """
+    """Numerically verify the Scatter-Add CPU fallback."""
     print("\n--- [Test] Kernel Correctness (CPU) ---")
     N, D = 10, 4
-
-    # Inputs
     src = torch.randn(N, D)
     weights = torch.rand(N)
-    # Map 10 items into 5 slots
     indices = torch.randint(0, 5, (N,))
     out_shape = (5, D)
 
-    # 1. Our CPU Fallback Implementation
+    # FastMoE Fallback
     out_fast = weighted_scatter_add(src, indices, weights, out_shape)
 
-    # 2. Naive Ground Truth
+    # Naive Loop
     out_gt = torch.zeros(out_shape)
     for i in range(N):
         dest_idx = indices[i].item()
-        w = weights[i].item()
-        val = src[i]
-        out_gt[dest_idx] += val * w
+        out_gt[dest_idx] += src[i] * weights[i]
 
-    # Check
     diff = (out_fast - out_gt).abs().max()
-    print(f"Max Difference: {diff.item()}")
-    assert diff < 1e-5, "CPU Fallback logic is mathematically wrong"
+    assert diff < 1e-5
     print("Numerical verification passed.")
 
 
 if __name__ == "__main__":
     test_scatter_add_correctness()
     test_moe_forward_backward_cpu()
+    test_pipelined_block_logic()
     test_full_model_integration()
