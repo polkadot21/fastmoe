@@ -111,19 +111,16 @@ def generate_overlap_trace(cfg: MoESetup, rank: int = 0):
 
     device = torch.device(f"cuda:{rank}")
 
-    # Force 'FAST' implementation
     model = TinyModel(
         in_dim=cfg.hidden_dim,
         dim=cfg.hidden_dim,
-        n_heads=16,  # Standard head count
-        ff_dim=cfg.hidden_dim * 4,  # Standard MLP ratio
-        n_layers=2,  # Keep depth low, we only care about horizontal overlap
+        n_heads=16,
+        ff_dim=cfg.hidden_dim * 4,
+        n_layers=2,
         num_experts=cfg.num_experts,
         implementation=consts.MoEImplementation.FAST,
     ).to(device)
 
-    # Use Config dimensions!
-    # This ensures we hit the "Goldilocks" zone defined in TRACE_OPTIMIZED
     x = torch.randn(cfg.batch_size, cfg.seq_len, cfg.hidden_dim, device=device)
 
     # Warmup
@@ -131,16 +128,17 @@ def generate_overlap_trace(cfg: MoESetup, rank: int = 0):
         _ = model(x)
     torch.cuda.synchronize()
 
-    # Profiler
+    # We REMOVE 'on_trace_ready' so it doesn't auto-save.
+    # We keep the schedule so it knows when to record.
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ],
         schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler("./traces"),
+        # on_trace_ready=torch.profiler.tensorboard_trace_handler("./traces"), <--- DELETED
         record_shapes=True,
-        profile_memory=False,  # Disable memory profiling to reduce overhead
+        profile_memory=False,
         with_stack=True,
     ) as p:
         for i in range(5):
