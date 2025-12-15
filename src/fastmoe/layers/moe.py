@@ -8,6 +8,43 @@ from fastmoe.distributed import Communicator, PytorchCommunicator
 from fastmoe.kernels.ops import weighted_scatter_add
 
 
+def _calibrate_cycles_per_ms(device=None, target_ms=5.0):
+    if device is None:
+        device = torch.device("cuda")
+    torch.cuda.synchronize(device=device)
+    start = torch.cuda.Event(True)
+    end = torch.cuda.Event(True)
+
+    cycles = int(5e6)
+    for _ in range(12):
+        start.record()
+        torch.cuda._sleep(cycles)
+        end.record()
+        torch.cuda.synchronize(device=device)
+        ms = start.elapsed_time(end)
+        if ms <= 0:
+            cycles *= 2
+            continue
+        scale = target_ms / ms
+        cycles = int(cycles * (0.5 + 0.5 * scale))
+        if abs(ms - target_ms) / target_ms < 0.05:
+            break
+    return cycles / target_ms  # cycles per ms
+
+
+# Cache per process
+_CYCLES_PER_MS = None
+
+
+def gpu_sleep_ms(ms: float, device: torch.device):
+    global _CYCLES_PER_MS
+    if ms <= 0:
+        return
+    if _CYCLES_PER_MS is None:
+        _CYCLES_PER_MS = _calibrate_cycles_per_ms(device=device, target_ms=5.0)
+    torch.cuda._sleep(int(ms * _CYCLES_PER_MS))
+
+
 class MoEFeedForward(nn.Module):
     def __init__(
         self,
@@ -52,7 +89,9 @@ class MoEFeedForward(nn.Module):
 
         self.router = nn.Linear(dim, num_experts, bias=False)
 
-    def forward(self, x: torch.Tensor, group=None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, group=None, comm_stream=None, simulate_a2a_ms: float = 0.0
+    ) -> torch.Tensor:
         B, T, D = x.shape
         x_flat = x.view(-1, D)  # [BT, D]
         n_tokens = x_flat.shape[0]
@@ -96,8 +135,14 @@ class MoEFeedForward(nn.Module):
         x_rep = x_flat.repeat_interleave(self.top_k, dim=0)  # [BT*K, D]
         x_permuted = x_rep.index_select(0, sorted_indices)
 
+        # Simulate network delay on comm stream if specified
         recv_data = self.all_to_all(
-            x_permuted, send_counts.tolist(), recv_counts.tolist(), group=group
+            x_permuted,
+            send_counts.tolist(),
+            recv_counts.tolist(),
+            group=group,
+            comm_stream=comm_stream,
+            simulate_ms=simulate_a2a_ms,
         )
 
         # ---------------------------------------------------------------------
@@ -150,8 +195,14 @@ class MoEFeedForward(nn.Module):
             else torch.empty(0, self.dim, device=x.device, dtype=x.dtype)
         )
 
+        # Simulate network delay on comm stream if specified for return
         combined_output = self.all_to_all(
-            final_out_buffer, recv_counts.tolist(), send_counts.tolist(), group=group
+            final_out_buffer,
+            recv_counts.tolist(),
+            send_counts.tolist(),
+            group=group,
+            comm_stream=comm_stream,
+            simulate_ms=simulate_a2a_ms,
         )
 
         # ---------------------------------------------------------------------
@@ -164,18 +215,45 @@ class MoEFeedForward(nn.Module):
         out_flat = weighted_scatter_add(combined_output, tok_perm, w_perm, out_shape=(n_tokens, D))
         return out_flat.view(B, T, D)
 
-    def all_to_all(self, x, send_counts, recv_counts, group=None):
+    def all_to_all(
+        self, x, send_counts, recv_counts, group=None, comm_stream=None, simulate_ms: float = 0.0
+    ):
         if self.world_size == 1:
             return x
 
         total_recv = sum(recv_counts)
         output = torch.empty(total_recv, x.size(1), device=x.device, dtype=x.dtype)
 
-        dist.all_to_all_single(
-            output,
-            x,
-            output_split_sizes=recv_counts,
-            input_split_sizes=send_counts,
-            group=group,
-        )
+        # Default behavior is to run on current stream
+        if comm_stream is None:
+            if simulate_ms > 0:
+                gpu_sleep_ms(simulate_ms, x.device)
+            dist.all_to_all_single(
+                output,
+                x,
+                output_split_sizes=recv_counts,
+                input_split_sizes=send_counts,
+                group=group,
+            )
+            return output
+
+        # Run NCCL on comm stream
+        with torch.cuda.stream(comm_stream):
+            # Ensure allocator doesn't reuse buffers too early
+            x.record_stream(comm_stream)
+            output.record_stream(comm_stream)
+
+            if simulate_ms > 0:
+                gpu_sleep_ms(simulate_ms, x.device)
+
+            dist.all_to_all_single(
+                output,
+                x,
+                output_split_sizes=recv_counts,
+                input_split_sizes=send_counts,
+                group=group,
+            )
+
+        # Consumer is current stream, so it must wait for comm_stream to finish
+        torch.cuda.current_stream().wait_stream(comm_stream)
         return output
