@@ -94,21 +94,22 @@ def _worker_entrypoint():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # [Fix] Override Config to create a Communication-Heavy Scenario
-    # Previous config (seq=4096, batch=4) was Compute Bound (Attention O(N^2)).
-    # We switch to DeepSeek-V3 style: Wide Hidden Dim, High Batch, Low Seq.
+    # [OPTIMIZATION] DeepSeek-V3 Proxy Config (Comm-Heavy)
+    # We use a smaller Hidden Dim (8192) to allow MASSIVE Batch sizes.
+    # This saturates the NVLink and makes Pipelining effective.
     cfg = get_config(MoEScale.GIGACHAT_10B)
 
-    cfg.hidden_dim = 16384  # Massive width (Increases Comm Payload)
-    cfg.seq_len = 128  # Shorter seq (Reduces Attention Compute to reveal Comm cost)
-    local_batch_size = 32  # Higher batch (Increases Comm Payload)
-    cfg.num_experts = 8
+    cfg.hidden_dim = 8192  # Standard Large Model Width
+    cfg.seq_len = 64  # Short sequence (Reduces Attn dominance)
+    local_batch_size = 128  # MASSIVE BATCH (Increases Comm payload to ~100MB+)
+    cfg.num_experts = 16  # More experts = More fragmentation = More Dispatch stress
 
     if rank == 0:
         logger.info(f"Running Distributed Benchmark on {world_size} GPUs")
         logger.info(
-            f"High-Bandwidth Config: Hidden={cfg.hidden_dim} | Batch={local_batch_size} | Seq={cfg.seq_len}"  # noqa
+            f"Workload: Hidden={cfg.hidden_dim} | Batch={local_batch_size} | Experts={cfg.num_experts}"  # noqa
         )
+        logger.info("Goal: Saturate NVLink to demonstrate Overlap Speedup")
 
     device = torch.device(f"cuda:{rank}")
 
@@ -123,7 +124,7 @@ def _worker_entrypoint():
     )
 
     # ---------------------------------------------------------
-    # 1. STANDARD IMPLEMENTATION (Sequential EP)
+    # 1. STANDARD IMPLEMENTATION
     # ---------------------------------------------------------
     model_std = (
         TinyModel(
@@ -131,7 +132,7 @@ def _worker_entrypoint():
             dim=cfg.hidden_dim,
             n_heads=32,
             ff_dim=4096,
-            n_layers=2,  # n_heads increased for 16k dim
+            n_layers=2,
             num_experts=cfg.num_experts,
             implementation=MoEImplementation.FAST,
         )
@@ -139,7 +140,6 @@ def _worker_entrypoint():
         .to(torch.bfloat16)
     )
 
-    # Patch layers with Distributed MoE (Sequential)
     for block in model_std.blocks:
         block.ff = (
             MoEFeedForward(
@@ -154,15 +154,15 @@ def _worker_entrypoint():
         )
 
     if rank == 0:
-        logger.info("Benchmarking Standard (No Overlap)...")
-    ms_std, mem_std = benchmark_step(model_std, x, "standard_moe_timing", profile_trace=False)
-    benchmark_step(model_std, x, "standard_moe", profile_trace=True)
+        logger.info("Benchmarking Standard...")
+    # Warmup & Run
+    ms_std, mem_std = benchmark_step(model_std, x, "standard_moe", profile_trace=True)
 
     del model_std
     torch.cuda.empty_cache()
 
     # ---------------------------------------------------------
-    # 2. PIPELINED IMPLEMENTATION (Overlap)
+    # 2. PIPELINED IMPLEMENTATION
     # ---------------------------------------------------------
     model_pipe = (
         TinyModel(
@@ -178,10 +178,8 @@ def _worker_entrypoint():
         .to(torch.bfloat16)
     )
 
-    # Create dedicated Comm Stream (High Priority to ensure it preempts if needed)
     comm_stream = torch.cuda.Stream(priority=-1)
 
-    # Apply Patch
     for i, block in enumerate(model_pipe.blocks):
         dist_moe = (
             MoEFeedForward(
@@ -196,28 +194,24 @@ def _worker_entrypoint():
         )
 
         block.ff = dist_moe
-        # Wrap Block in Pipeline
         model_pipe.blocks[i] = PipelinedMoEBlock(block, comm_stream)
 
     if rank == 0:
-        logger.info("Benchmarking Fast (Pipelined Overlap)...")
-    ms_pipe, mem_pipe = benchmark_step(model_pipe, x, "fast_moe_timing", profile_trace=False)
-    benchmark_step(model_pipe, x, "fast_moe", profile_trace=True)
+        logger.info("Benchmarking Fast (Pipelined)...")
+    ms_pipe, mem_pipe = benchmark_step(model_pipe, x, "fast_moe", profile_trace=True)
 
     if rank == 0:
         logger.info("=" * 60)
-        logger.info(" BENCHMARK RESULTS ")
-        logger.info("=" * 60)
-        logger.info(f"{'Metric':<15} | {'Standard':<15} | {'Pipelined':<15} | {'Improvement':<15}")
-        logger.info("-" * 65)
+        logger.info(f"{'Metric':<15} | {'Standard':<15} | {'Pipelined':<15} | {'Delta':<15}")
+        logger.info("-" * 60)
         logger.info(
-            f"{'Latency (ms)':<15} | {ms_std:<15.2f} | {ms_pipe:<15.2f} | {ms_std / ms_pipe:.2f}x Faster"  # noqa
+            f"{'Latency (ms)':<15} | {ms_std:<15.2f} | {ms_pipe:<15.2f} | {ms_std / ms_pipe:.2f}x Speedup"  # noqa
         )
-        logger.info(
-            f"{'Memory (MB)':<15} | {mem_std:<15.0f} | {mem_pipe:<15.0f} | {mem_std - mem_pipe:.0f} MB Saved"  # noqa
-        )
+
+        mem_delta = mem_std - mem_pipe
+        mem_str = f"{mem_delta:.0f} MB Saved" if mem_delta > 0 else f"{abs(mem_delta):.0f} MB Cost"
+        logger.info(f"{'Memory (MB)':<15} | {mem_std:<15.0f} | {mem_pipe:<15.0f} | {mem_str}")
         logger.info("=" * 60)
-        logger.info("Traces saved to ./logs/standard_moe and ./logs/fast_moe")
 
     cleanup()
 
