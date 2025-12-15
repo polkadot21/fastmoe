@@ -69,8 +69,8 @@ class PipelinedMoEBlock(nn.Module):
         with record_function("Pipe: Experts C1"):
             eo1 = self.moe.compute_experts(c1_meta["rd"], c1_meta["rc"])
 
-            # [Optimization] Clear intermediate buffers immediately
-            del c1_meta["rd"], c1_meta["rc"]
+            # [FIX] Only delete 'rd' (Heavy Data). Keep 'rc' (Metadata) for Combine step.
+            del c1_meta["rd"]
             c1_meta["eo"] = eo1
         ev_compute_c1.record()
 
@@ -85,8 +85,9 @@ class PipelinedMoEBlock(nn.Module):
 
             self.comm_stream.wait_event(ev_compute_c1)
             with record_function("Pipe: Combine C1"):
+                # 'rc' is safe to use here now
                 fd1 = self.moe.combine_exchange(c1_meta["eo"], c1_meta["rc"], c1_meta["sc"])
-                del c1_meta["eo"]  # Free memory
+                del c1_meta["eo"], c1_meta["rc"]  # Now we can delete it
 
                 # Unpermute
                 res1 = self.moe.unpermute(fd1, c1_meta["rev"], c1_meta["w"], c1_meta["s"])
@@ -96,7 +97,7 @@ class PipelinedMoEBlock(nn.Module):
         torch.cuda.current_stream().wait_event(ev_dispatch_c2)
         with record_function("Pipe: Experts C2"):
             eo2 = self.moe.compute_experts(c2_meta["rd"], c2_meta["rc"])
-            del c2_meta["rd"], c2_meta["rc"]
+            del c2_meta["rd"]  # Only delete data
 
         # --- STEP 5: Combine C2 ---
         torch.cuda.current_stream().wait_stream(self.comm_stream)
@@ -106,13 +107,9 @@ class PipelinedMoEBlock(nn.Module):
             res2 = self.moe.unpermute(fd2, c2_meta["rev"], c2_meta["w"], c2_meta["s"])
             del fd2, c2_meta, eo2
 
-        # --- FINAL: Incremental Add ---
         # We manually add residuals to each chunk.
         # This keeps the peak memory lower than cat(res1, res2) + x.
         out1 = res1 + c1_resid
         out2 = res2 + c2_resid
 
-        # Finally Cat.
-        # Since we deleted intermediates and effectively replaced res1/res2 with out1/out2,
-        # we reduced the peak overlap.
         return torch.cat([out1, out2], dim=0)
