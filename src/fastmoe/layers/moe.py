@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fastmoe import consts
-from fastmoe.distributed import Communicator, PytorchCommunicator
 from fastmoe.kernels.ops import grouped_weighted_scatter_add
 
 
@@ -16,14 +15,12 @@ class MoEFeedForward(nn.Module):
         num_experts=8,
         top_k=2,
         implementation=consts.MoEImplementation.FAST,
-        communicator: Communicator = None,
     ):
         super().__init__()
         self.dim = dim
         self.num_experts = num_experts
         self.top_k = top_k
         self.implementation = implementation  # Store it
-        self.comm = communicator if communicator else PytorchCommunicator()
 
         # Distributed Setup
         if dist.is_initialized():
@@ -81,7 +78,7 @@ class MoEFeedForward(nn.Module):
 
         # 3. Handshake (Exchange Counts)
         local_send_counts = rank_counts
-        local_recv_counts = self.comm.exchange_counts(local_send_counts)
+        local_recv_counts = local_send_counts  # for world_size = 1
 
         # Convert to lists for NCCL
         send_splits = local_send_counts.tolist()
@@ -89,7 +86,7 @@ class MoEFeedForward(nn.Module):
 
         # 4. Data Exchange
         # Now passing all 3 required arguments
-        recv_data = self.comm.all_to_all(permuted_data, send_splits, recv_splits)
+        recv_data = permuted_data  # for world_size = 1
 
         return (
             recv_data,
@@ -219,65 +216,6 @@ class MoEFeedForward(nn.Module):
                 expert_outputs_list, reverse_map_indices, sorted_weights, (B * T, D)
             )
             return out.view(B, T, D)
-
-    # def combine(
-    #     self,
-    #     expert_outputs_list,
-    #     reverse_map_indices,
-    #     sorted_weights,
-    #     original_shape,
-    #     send_splits,
-    #     recv_splits,
-    # ):
-    #     B, T = original_shape
-    #     D = self.dim
-
-    #     # 1. Concat for communication (Unavoidable for network transmission)
-    #     # Note: If we are local, we can skip this, but let's be rigorous.
-    #     if self.world_size > 1:
-    #         expert_output_flat = torch.cat(expert_outputs_list)
-
-    #         # Inverse Communication
-    #         recv_back = self.comm.all_to_all(
-    #             expert_output_flat,
-    #             send_counts=recv_splits,  # We send what we received
-    #             recv_counts=send_splits,
-    #         )  # We receive what we sent
-
-    #         # We now have 'recv_back', but the Grouped Kernel expects a LIST of expert tensors.
-    #         # We must re-split 'recv_back' into per-expert chunks to use the fast kernel?
-    #         # NO. 'recv_back' is now ordered by the Original Sender.
-    #         #
-    #         # Actually, the Fast Kernel Optimization ("No-Cat") is most effective when:
-    #         # 1. We are local (no network).
-    #         # 2. OR we operate on the data *before* sending it back? No, combine happens after return. # noqa
-    #         #
-    #         # If we used All-to-All, we received a monolithic tensor 'recv_back'.
-    #         # We can use the Single-Tensor Scatter Add (which we kept as a wrapper).
-    #         # OR we can treat it as a list of 1 tensor.
-
-    #         # For the single-GPU benchmark where world_size=1:
-    #         # self.comm.all_to_all returns the input list? No, PytorchCommunicator expects tensor.
-    #         pass
-    #     else:
-    #         # OPTIMIZED PATH (Local / Benchmark)
-    #         # We skip the "Cat for Network" and pass the list directly to the kernel.
-    #         # This is what enables the 13x memory reduction in your benchmark.
-    #         recv_back_list = expert_outputs_list
-
-    #     if isinstance(recv_back_list, list):
-    #         # Grouped Kernel Path
-    #         out = grouped_weighted_scatter_add(
-    #             recv_back_list, reverse_map_indices, sorted_weights, (B * T, D)
-    #         )
-    #     else:
-    #         # Network Path (received one big tensor)
-    #         # Use the wrapper that handles single tensor -> grouped kernel
-    #         out = grouped_weighted_scatter_add(
-    #             [recv_back], reverse_map_indices, sorted_weights, (B * T, D)
-    #         )
-
-    #     return out.view(B, T, D)
 
     def forward(self, x):
         # [B, T, D] -> [N, D], where N = B x T, because the router treats tokens independently
