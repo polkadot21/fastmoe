@@ -26,11 +26,11 @@ def verify_correctness(expert_outputs, indices, weights, out_shape):
     # A. Standard (Cat -> IndexAdd)
     combined = torch.cat(expert_outputs, dim=0)
     weighted = combined * weights.unsqueeze(-1)
-    out_std = torch.zeros(out_shape, device=device)
+    out_std = torch.zeros(out_shape, device=device, dtype=combined.dtype)
     out_std.index_add_(0, indices, weighted)
 
     # B. FastMoE (Grouped Kernel)
-    out_fast = torch.zeros(out_shape, device=device)
+    out_fast = torch.zeros(out_shape, device=device, dtype=combined.dtype)
     grouped_weighted_scatter_add(expert_outputs, indices, weights, out_shape, out=out_fast)
 
     torch.cuda.synchronize()
@@ -54,7 +54,7 @@ def benchmark_standard(expert_outputs, indices, weights, out_shape, steps):
     for _ in range(steps):
         combined = torch.cat(expert_outputs, dim=0)
         weighted = combined * weights.unsqueeze(-1)
-        out = torch.zeros(out_shape, device=expert_outputs[0].device)
+        out = torch.zeros(out_shape, device=expert_outputs[0].device, dtype=combined.dtype)
         out.index_add_(0, indices, weighted)
     end_event.record()
 
@@ -68,7 +68,7 @@ def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps
     torch.cuda.reset_peak_memory_stats()
     device = expert_outputs[0].device
 
-    out_static = torch.zeros(out_shape, device=device)
+    out_static = torch.zeros(out_shape, device=device, dtype=expert_outputs[0].dtype)
     metadata = prepare_grouped_metadata(expert_outputs, device)
 
     # Warmup & Graph Capture
@@ -111,12 +111,11 @@ def run_training_experiment(
     torch.cuda.reset_peak_memory_stats()
     device = torch.device(f"cuda:{rank}")
 
-    # Use a heavier configuration for the training loop to emphasize compute
     model = TinyModel(
         in_dim=cfg.hidden_dim,
         dim=cfg.hidden_dim,
-        n_heads=32,  # Heavy attention
-        ff_dim=cfg.hidden_dim * 4,  # Standard MLP ratio (4x)
+        n_heads=32,
+        ff_dim=cfg.hidden_dim * 4,
         n_layers=2,
         num_experts=cfg.num_experts,
         top_k=cfg.top_k,
@@ -145,10 +144,9 @@ def run_training_experiment(
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
 
-    # --- Profiling Setup ---
     prof = None
     if trace_filename:
         prof = profile(
@@ -156,7 +154,7 @@ def run_training_experiment(
             schedule=schedule(wait=0, warmup=0, active=5, repeat=1),
             record_shapes=True,
             with_stack=True,
-            on_trace_ready=None,  # We export manually
+            on_trace_ready=None,
         )
         prof.start()
 
@@ -168,7 +166,6 @@ def run_training_experiment(
 
     start_event.record()
     for step in range(steps):
-        # Giant Scope to measure the ENTIRE step cost (Python + GPU)
         with record_function(f"Global Step {step} [{implementation.upper()}]"):
             with record_function("Forward"):
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
@@ -183,7 +180,7 @@ def run_training_experiment(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
         if rank == 0 and not trace_filename and (step % 10 == 0 or step == steps - 1):
             curr_mem = torch.cuda.memory_allocated() / (1024**3)
@@ -198,28 +195,24 @@ def run_training_experiment(
     if prof:
         prof.stop()
         if rank == 0:
+            os.makedirs("./traces", exist_ok=True)
             prof.export_chrome_trace(f"./traces/{trace_filename}")
             logger.success(f"Trace saved: ./traces/{trace_filename}")
 
     avg_time = start_event.elapsed_time(end_event) / steps
     peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
-
     return avg_time, peak_mem
 
 
 # -------------------------------------------------------------------------
-# 3. Main Worker (Called by either torchrun or mp.spawn)
+# 3. Main Worker
 # -------------------------------------------------------------------------
 
 
 def main_worker(rank, world_size):
-    """
-    The actual entry point for the process.
-    rank: Global rank of the process (0..N-1).
-    world_size: Total number of GPUs.
-    """
     if os.environ.get("MASTER_ADDR") is None:
-        os.environ["MASTER_ADDR"] = "localhost"
+        # Force IPv4 to avoid localhost->IPv6 issues on some systems
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "12355"
 
     if not dist.is_initialized():
@@ -242,7 +235,7 @@ def main_worker(rank, world_size):
         torch.randn(chunk_size, cfg.hidden_dim, device=device) for _ in range(cfg.num_experts)
     ]
     indices = torch.randint(0, cfg.batch_size * cfg.seq_len, (total_tokens,), device=device)
-    weights = torch.rand(total_tokens, device=device)
+    weights = torch.rand(total_tokens, device=device, dtype=expert_outputs[0].dtype)
     out_shape = (cfg.batch_size * cfg.seq_len, cfg.hidden_dim)
 
     base_mem = torch.cuda.memory_allocated() / (1024**2)
@@ -309,9 +302,6 @@ def main_worker(rank, world_size):
 
 
 def run_on_cloud():
-    """
-    Entry point. Detects if running via torchrun or needs mp.spawn.
-    """
     if not torch.cuda.is_available():
         logger.warning("No CUDA detected. Skipping.")
         return
