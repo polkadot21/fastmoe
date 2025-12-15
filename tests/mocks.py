@@ -23,18 +23,14 @@ class MockStream:
 
 
 class MockEvent:
-    # Accept *args and **kwargs to handle enable_timing=False and any other future args
-    def __init__(self, enable_timing=False, **kwargs):
-        pass
-
     def record(self, stream=None):
         pass
 
     def wait(self, stream=None):
         pass
 
-    def query(self):
-        return True
+    def synchronize(self):
+        pass
 
     def elapsed_time(self, end_event):
         return 0.0

@@ -3,10 +3,9 @@ import torch.nn.functional as F
 
 from fastmoe import consts
 from fastmoe.layers.moe import MoEFeedForward
-from fastmoe.layers.pipelined_block import PipelinedMoEBlock
-from fastmoe.streams import MoEStreamManager
 
 
+# [Exact Copy of MultiheadSelfAttention from your provided snippet]
 class MultiheadSelfAttention(nn.Module):
     def __init__(self, dim, n_heads):
         super().__init__()
@@ -17,7 +16,7 @@ class MultiheadSelfAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x):
+    def forward(self, x):  # x: [B,T,D]
         B, T, D = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.hd).transpose(1, 2)
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
@@ -31,6 +30,7 @@ class MultiheadSelfAttention(nn.Module):
         return self.proj(out)
 
 
+# [Standard FF kept for reference/hybrid models]
 class FeedForward(nn.Module):
     def __init__(self, dim, ff_dim):
         super().__init__()
@@ -41,13 +41,27 @@ class FeedForward(nn.Module):
         return self.fc2(F.gelu(self.fc1(x)))
 
 
-class SequentialBlock(nn.Module):
-    def __init__(self, attn_layer, ff_layer, dim):
+class Block(nn.Module):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        ff_dim,
+        use_moe=True,
+        num_experts=4,
+        implementation=consts.MoEImplementation.FAST,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = attn_layer
+        self.attn = MultiheadSelfAttention(dim, n_heads)
         self.norm2 = nn.LayerNorm(dim)
-        self.ff = ff_layer
+
+        if use_moe:
+            self.ff = MoEFeedForward(
+                dim, ff_dim, num_experts=num_experts, implementation=implementation
+            )
+        else:
+            self.ff = FeedForward(dim, ff_dim)
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
@@ -64,55 +78,24 @@ class TinyModel(nn.Module):
         ff_dim=2048,
         n_layers=4,
         num_experts=4,
-        implementation=consts.MoEImplementation.FAST,
-        use_moe=True,
-        top_k=2,
+        implementation="fast",
     ):
         super().__init__()
         self.inp = nn.Linear(in_dim, dim, bias=False)
-        self.blocks = nn.ModuleList()
-        self.out = nn.Linear(dim, in_dim, bias=False)
-
-        self.stream_manager = None
-
-        for i in range(n_layers):
-            attn = MultiheadSelfAttention(dim, n_heads)
-
-            layer_uses_moe = use_moe
-            if layer_uses_moe:
-                ff = MoEFeedForward(
-                    dim, ff_dim, num_experts=num_experts, top_k=top_k, implementation=implementation
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    dim,
+                    n_heads,
+                    ff_dim,
+                    use_moe=True,
+                    num_experts=num_experts,
+                    implementation=implementation,
                 )
-            else:
-                ff = FeedForward(dim, ff_dim)
-
-            if layer_uses_moe and (
-                implementation == consts.MoEImplementation.FAST or implementation == "fast"
-            ):
-                block = PipelinedMoEBlock(attn, ff, dim, manager=None, block_idx=i)
-            else:
-                block = SequentialBlock(attn, ff, dim)
-
-            self.blocks.append(block)
-
-    def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-
-        try:
-            device = next(self.parameters()).device
-        except StopIteration:
-            return self
-
-        # Only create stream manager if we actually have pipelined blocks.
-        if device.type == "cuda" and self.stream_manager is None:
-            has_pipelined = any(isinstance(b, PipelinedMoEBlock) for b in self.blocks)
-            if has_pipelined:
-                self.stream_manager = MoEStreamManager(device)
-                for block in self.blocks:
-                    if isinstance(block, PipelinedMoEBlock):
-                        block.manager = self.stream_manager
-
-        return self
+                for _ in range(n_layers)
+            ]
+        )
+        self.out = nn.Linear(dim, in_dim, bias=False)
 
     def forward(self, x):
         x = self.inp(x)
