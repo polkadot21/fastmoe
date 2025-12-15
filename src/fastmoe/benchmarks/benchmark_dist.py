@@ -1,5 +1,8 @@
+import os
+
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from loguru import logger
 from torch.profiler import ProfilerActivity, profile, record_function
 
@@ -9,14 +12,31 @@ from fastmoe.layers.moe import MoEFeedForward
 from fastmoe.layers.pipeline import PipelinedMoEBlock
 from fastmoe.models.tiny_model import TinyModel
 
+# =============================================================================
+#  Distributed Helpers
+# =============================================================================
+
 
 def setup():
-    dist.init_process_group("nccl")
-    torch.cuda.set_device(dist.get_rank())
+    """Initializes the distributed process group."""
+    if not dist.is_initialized():
+        # "env://" tells PyTorch to read MASTER_ADDR, RANK, etc. from environment
+        dist.init_process_group("nccl", init_method="env://")
+
+    # Ensure we pin the correct device for this process
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+    torch.cuda.set_device(local_rank)
 
 
 def cleanup():
-    dist.destroy_process_group()
+    """Destroys the process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+# =============================================================================
+#  Benchmarking Logic (The Worker)
+# =============================================================================
 
 
 def benchmark_step(model, x, desc, profile_trace=False):
@@ -28,18 +48,23 @@ def benchmark_step(model, x, desc, profile_trace=False):
     steps = 10
 
     if profile_trace:
+        # Generate Chrome Traces
+        log_path = f"./logs/{desc}"
+        os.makedirs(log_path, exist_ok=True)
+
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(f"./logs/{desc}"),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(log_path),
         ) as prof:
             for _ in range(steps):
                 with record_function("Model Step"):
                     out = model(x)
                     out.mean().backward()
                 prof.step()
+        return 0.0  # Timing not relevant during profiling
     else:
-        # Timing
+        # Strict Timing
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -51,16 +76,18 @@ def benchmark_step(model, x, desc, profile_trace=False):
         return start.elapsed_time(end) / steps
 
 
-def run_benchmark():
+def _worker_entrypoint():
+    """
+    The actual benchmarking logic that runs on each GPU.
+    """
     setup()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    cfg = get_config(MoEScale.GIGACHAT_10B)  # Use manageable size
-
-    # Adjust config for distributed
-    cfg.num_experts = 8  # Total experts
-    local_batch_size = 4  # Must be divisible by 2 for pipeline
+    # Config matching 2x H100 capacity
+    cfg = get_config(MoEScale.GIGACHAT_10B)
+    cfg.num_experts = 8
+    local_batch_size = 4  # Divisible by 2 for pipeline
 
     if rank == 0:
         logger.info(f"Running Distributed Benchmark on {world_size} GPUs")
@@ -78,9 +105,9 @@ def run_benchmark():
         requires_grad=True,
     )
 
-    # ==========================================
+    # ---------------------------------------------------------
     # 1. STANDARD IMPLEMENTATION
-    # ==========================================
+    # ---------------------------------------------------------
     model_std = (
         TinyModel(
             in_dim=cfg.hidden_dim,
@@ -89,13 +116,13 @@ def run_benchmark():
             ff_dim=1024,
             n_layers=2,
             num_experts=cfg.num_experts,
-            implementation=MoEImplementation.FAST,  # Use Fast Kernel, but Standard Pipeline
+            implementation=MoEImplementation.FAST,
         )
         .to(device)
         .to(torch.bfloat16)
     )
 
-    # Patch layers with Distributed MoE
+    # Patch layers with Distributed MoE (Sequential)
     for block in model_std.blocks:
         block.ff = (
             MoEFeedForward(
@@ -109,17 +136,18 @@ def run_benchmark():
             .to(torch.bfloat16)
         )
 
-    # Run Standard
     if rank == 0:
         logger.info("Benchmarking Standard (No Overlap)...")
-    ms_std = benchmark_step(model_std, x, "standard_moe", profile_trace=True)
+    # We do a quick timing run first, then profile
+    ms_std = benchmark_step(model_std, x, "standard_moe_timing", profile_trace=False)
+    benchmark_step(model_std, x, "standard_moe", profile_trace=True)  # Trace run
 
     del model_std
     torch.cuda.empty_cache()
 
-    # ==========================================
+    # ---------------------------------------------------------
     # 2. PIPELINED IMPLEMENTATION (OVERLAP)
-    # ==========================================
+    # ---------------------------------------------------------
     model_pipe = (
         TinyModel(
             in_dim=cfg.hidden_dim,
@@ -135,11 +163,10 @@ def run_benchmark():
     )
 
     # Create dedicated Comm Stream
-    comm_stream = torch.cuda.Stream(priority=-1)  # High priority? Or standard.
+    comm_stream = torch.cuda.Stream(priority=-1)
 
     # Apply Patch
     for i, block in enumerate(model_pipe.blocks):
-        # 1. Create Dist MoE
         dist_moe = (
             MoEFeedForward(
                 cfg.hidden_dim,
@@ -152,15 +179,14 @@ def run_benchmark():
             .to(torch.bfloat16)
         )
 
-        # 2. Replace FF
         block.ff = dist_moe
-
-        # 3. Wrap Block in Pipeline
+        # Wrap Block in Pipeline
         model_pipe.blocks[i] = PipelinedMoEBlock(block, comm_stream)
 
     if rank == 0:
         logger.info("Benchmarking Fast (Pipelined Overlap)...")
-    ms_pipe = benchmark_step(model_pipe, x, "fast_moe", profile_trace=True)
+    ms_pipe = benchmark_step(model_pipe, x, "fast_moe_timing", profile_trace=False)
+    benchmark_step(model_pipe, x, "fast_moe", profile_trace=True)  # Trace run
 
     if rank == 0:
         logger.success(f"Standard: {ms_std:.2f} ms")
@@ -169,3 +195,49 @@ def run_benchmark():
         logger.info("Traces saved to ./logs/standard_moe and ./logs/fast_moe")
 
     cleanup()
+
+
+# =============================================================================
+#  Launcher Logic (Notebook / Single Script Support)
+# =============================================================================
+
+
+def _spawn_worker(rank, world_size):
+    """
+    The wrapper function passed to mp.spawn.
+    Sets up the environment variables needed by 'setup()'
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+
+    try:
+        _worker_entrypoint()
+    except Exception as e:
+        logger.error(f"Rank {rank} failed: {e}")
+        raise e
+
+
+def run_benchmark():
+    """
+    Public Entrypoint.
+    Auto-detects whether to run as a worker or spawn a cluster.
+    """
+    # 1. Check if we are already inside a distributed job (e.g. torchrun)
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        _worker_entrypoint()
+        return
+
+    # 2. Notebook / Direct execution mode -> Spawn Processes
+    world_size = torch.cuda.device_count()
+    if world_size < 2:
+        logger.warning(
+            f"Detected {world_size} GPU. Pipeline Parallelism requires at least 2 for effective demo."  # noqa
+        )
+        # Proceed anyway for debugging if user forces it
+
+    logger.info(f"Spawning {world_size} workers for DeepSeek-V3 EP Benchmark...")
+
+    mp.spawn(_spawn_worker, args=(world_size,), nprocs=world_size, join=True)
