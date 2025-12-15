@@ -20,11 +20,9 @@ from fastmoe.models.tiny_model import TinyModel
 def setup():
     """Initializes the distributed process group."""
     if not dist.is_initialized():
-        # [Fix] Use 127.0.0.1 explicitly to avoid IPv6/localhost ambiguity issues
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         dist.init_process_group("nccl", init_method="env://")
 
-    # Ensure we pin the correct device for this process
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
     torch.cuda.set_device(local_rank)
 
@@ -45,14 +43,12 @@ def benchmark_step(model, x, desc, profile_trace=False):
     for _ in range(5):
         _ = model(x)
     torch.cuda.synchronize()
-
-    # Reset Memory Stats for clean reading
     torch.cuda.reset_peak_memory_stats()
 
     steps = 10
 
     if profile_trace:
-        # Generate Chrome Traces
+        # --- PROFILING PASS (Trace Generation) ---
         log_path = f"./logs/{desc}"
         os.makedirs(log_path, exist_ok=True)
 
@@ -61,19 +57,20 @@ def benchmark_step(model, x, desc, profile_trace=False):
             record_shapes=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(log_path),
         ) as prof:
-            for _ in range(steps):
-                with record_function("Model Step"):
+            for i in range(steps):
+                with record_function(f"Model Step: {i}"):
                     out = model(x)
                     out.mean().backward()
                 prof.step()
 
-        # Calculate Memory
-        peak_mem = torch.cuda.max_memory_allocated() / (1024**2)  # MB
-        return 0.0, peak_mem
+        # Return 0.0 for time because profiling overhead invalidates it.
+        # We only care about the trace file here.
+        return 0.0, 0.0
     else:
-        # Strict Timing
+        # --- TIMING PASS (Strict Latency Measurement) ---
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+
         start.record()
         for _ in range(steps):
             out = model(x)
@@ -87,33 +84,24 @@ def benchmark_step(model, x, desc, profile_trace=False):
 
 
 def _worker_entrypoint():
-    """
-    The actual benchmarking logic that runs on each GPU.
-    """
     setup()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # [OPTIMIZATION] DeepSeek-V3 Proxy Config (Comm-Heavy)
-    # We use a smaller Hidden Dim (8192) to allow MASSIVE Batch sizes.
-    # This saturates the NVLink and makes Pipelining effective.
+    # [CONFIG] DeepSeek-V3 Proxy (Comm-Heavy)
     cfg = get_config(MoEScale.GIGACHAT_10B)
-
-    cfg.hidden_dim = 8192  # Standard Large Model Width
-    cfg.seq_len = 64  # Short sequence (Reduces Attn dominance)
-    local_batch_size = 128  # MASSIVE BATCH (Increases Comm payload to ~100MB+)
-    cfg.num_experts = 16  # More experts = More fragmentation = More Dispatch stress
+    cfg.hidden_dim = 8192
+    cfg.seq_len = 64
+    local_batch_size = 128
+    cfg.num_experts = 16
 
     if rank == 0:
         logger.info(f"Running Distributed Benchmark on {world_size} GPUs")
         logger.info(
             f"Workload: Hidden={cfg.hidden_dim} | Batch={local_batch_size} | Experts={cfg.num_experts}"  # noqa
         )
-        logger.info("Goal: Saturate NVLink to demonstrate Overlap Speedup")
 
     device = torch.device(f"cuda:{rank}")
-
-    # Data
     x = torch.randn(
         local_batch_size,
         cfg.seq_len,
@@ -155,8 +143,11 @@ def _worker_entrypoint():
 
     if rank == 0:
         logger.info("Benchmarking Standard...")
-    # Warmup & Run
-    ms_std, mem_std = benchmark_step(model_std, x, "standard_moe", profile_trace=True)
+
+    # [FIX] Run Timing Pass FIRST to get valid ms_std
+    ms_std, mem_std = benchmark_step(model_std, x, "standard_moe_timing", profile_trace=False)
+    # [FIX] Run Profiling Pass SECOND (Optional, just for logs)
+    benchmark_step(model_std, x, "standard_moe", profile_trace=True)
 
     del model_std
     torch.cuda.empty_cache()
@@ -192,13 +183,16 @@ def _worker_entrypoint():
             .to(device)
             .to(torch.bfloat16)
         )
-
         block.ff = dist_moe
         model_pipe.blocks[i] = PipelinedMoEBlock(block, comm_stream)
 
     if rank == 0:
         logger.info("Benchmarking Fast (Pipelined)...")
-    ms_pipe, mem_pipe = benchmark_step(model_pipe, x, "fast_moe", profile_trace=True)
+
+    # [FIX] Run Timing Pass FIRST to get valid ms_pipe
+    ms_pipe, mem_pipe = benchmark_step(model_pipe, x, "fast_moe_timing", profile_trace=False)
+    # [FIX] Run Profiling Pass SECOND
+    benchmark_step(model_pipe, x, "fast_moe", profile_trace=True)
 
     if rank == 0:
         logger.info("=" * 60)
@@ -217,12 +211,12 @@ def _worker_entrypoint():
 
 
 # =============================================================================
-#  Launcher Logic
+#  Launcher
 # =============================================================================
 
 
 def _spawn_worker(rank, world_size):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"  # [Fix] Hardcoded to avoid socket errors
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "12355"
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
