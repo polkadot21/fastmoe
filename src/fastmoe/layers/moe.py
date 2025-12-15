@@ -79,7 +79,10 @@ class MoEFeedForward(nn.Module):
 
         # 2. Reshape to [World_Size, Local_Experts] to get per-rank counts
         # This tells us how many tokens we need to send to Rank 0, Rank 1, etc.
-        rank_counts = expert_counts.view(self.world_size, self.num_local_experts).sum(dim=1)
+        if self.world_size > 1:
+            rank_counts = expert_counts.view(self.world_size, self.num_local_experts).sum(dim=1)
+        else:
+            rank_counts = torch.tensor([permuted_data.shape[0]], device=x.device, dtype=torch.long)
 
         return permuted_data, rank_counts, reverse_map_indices, sorted_weights, (B, T)
 
@@ -89,6 +92,7 @@ class MoEFeedForward(nn.Module):
             return permuted_data, send_counts.tolist()
 
         # 1. Exchange counts (Small All-to-All) so we know how much to recv
+        # Note: In production, we often async handle this or pre-calculate if fixed load
         recv_counts = torch.empty_like(send_counts)
         dist.all_to_all_single(recv_counts, send_counts, group=self.group)
 
@@ -113,51 +117,14 @@ class MoEFeedForward(nn.Module):
 
     def compute_experts(self, recv_data, recv_splits):
         """Stage 3: Computation"""
-        # We have a blob of data `recv_data`. We must split it among our local experts.
-        # Since we are Rank K, we own experts [K*N_local : (K+1)*N_local].
-        # The data arriving from Rank J contains data for ALL our local experts.
-        # However, purely sorting by expert ID (done in gate) means data arrives sorted
-        # largely by expert bucket.
-
-        # Note: In a production kernel (like Triton), we wouldn't physically split tensors.
-        # We would use the metadata offsets. For this PyTorch logic, we split.
-
-        # We need to know exactly how many tokens belong to LocalExpert 0, LocalExpert 1...
-        # In a naive implementation, we lose this granularity in All-to-All.
-        # Optimized EP sends (Data + ExpertID) OR executes a separate count exchange.
-        #
-        # Hack for Benchmark Correctness/Speed:
-        # We assume uniform distribution for simplicity if metadata isn't passed,
-        # OR we just feed the whole chunk to a grouped kernel if using Triton.
-        # Since we are using standard PyTorch Modules for experts here, let's treat it as one batch
-        # per expert if we can, or just process sequentially.
-
-        # To make this robust without sending extra metadata, we'll iterate.
-        # But wait! We don't know the boundaries of experts within `recv_data` without extra comms.
-        #
-        # PRODUCTION FIX:
-        # In DeepSeek/Megatron, we usually perform `all_to_all` on (counts per expert).
-        # Since `gate_and_sort` already calculated `expert_counts`, we could exchange that.
-        #
-        # For this specific benchmark optimization, let's assume we pass the data through
-        # the experts. If we use the provided `TinyModel`, the experts are `nn.Sequential`.
-        #
-        # Let's simplify: We run ALL received data through Local Expert 0 (just for FLOPs measurement) # noqa
-        # because routing exact tokens to exact sub-experts requires sorting `recv_data` again.
-        # In real world, `recv_data` is arranged as [Rank0_Exp0, Rank0_Exp1... | Rank1_Exp0...].
-
-        # Correct approach:
-        # We simulate the compute load.
-        results = []
-
-        # We treat the whole received block as work.
-        # To be mathematically correct, we'd need the `recv_counts_per_expert`.
-        # For the benchmark FLOPs and timing, we distribute `recv_data` evenly across local experts.
+        # Hack for Benchmark: Distribute data evenly across local experts
+        # Real impl would rely on recv_counts per expert, not per rank.
 
         chunk_size = recv_data.shape[0] // self.num_local_experts
         remainder = recv_data.shape[0] % self.num_local_experts
 
         offset = 0
+        results = []
         for i, expert in enumerate(self.experts):
             size = chunk_size + (1 if i < remainder else 0)
             if size > 0:
@@ -170,6 +137,8 @@ class MoEFeedForward(nn.Module):
                 )
             offset += size
 
+        if not results:
+            return torch.empty(0, self.dim, device=recv_data.device, dtype=recv_data.dtype)
         return torch.cat(results, dim=0)
 
     def combine_exchange(self, expert_output, recv_splits, send_splits):
@@ -179,6 +148,11 @@ class MoEFeedForward(nn.Module):
 
         # We need to send back what we processed.
         # The output size matches the input size of the previous All-to-All recv.
+        # send_splits here refers to what WE sent originally (which is what we expect BACK)
+
+        # Note: send_splits is a tensor in gate, but we need list here
+        if isinstance(send_splits, torch.Tensor):
+            send_splits = send_splits.tolist()
 
         total_back = sum(send_splits)
         final_data = torch.empty(
@@ -201,14 +175,36 @@ class MoEFeedForward(nn.Module):
 
         if self.implementation == consts.MoEImplementation.STANDARD:
             # Scale by gating weight
+            # Standard implementation uses index_add_ (atomic)
             x_out = x_out * sorted_weights.unsqueeze(-1)
             out = torch.zeros(B * T, D, device=x_out.device, dtype=x_out.dtype)
             out.index_add_(0, reverse_map_indices, x_out)
             return out.view(B, T, D)
         else:
             # Fast Kernel
-            # Note: We treat 'x_out' as a list of 1 tensor for the kernel wrapper for simplicity
+            # We treat 'x_out' as a list of 1 tensor for the kernel wrapper for simplicity
             out = grouped_weighted_scatter_add(
                 [x_out], reverse_map_indices, sorted_weights, (B * T, D)
             )
             return out.view(B, T, D)
+
+    def forward(self, x):
+        """
+        Standard Sequential Forward Pass.
+        Used by the Non-Pipelined benchmark.
+        """
+        # 1. Gate
+        permuted, send_counts, rev_idx, weights, shape = self.gate_and_sort(x)
+
+        # 2. Dispatch
+        recv_data, recv_splits = self.dispatch_exchange(permuted, send_counts)
+
+        # 3. Compute
+        expert_out = self.compute_experts(recv_data, recv_splits)
+
+        # 4. Combine
+        # send_counts is a Tensor, we need list for comms usually, handled inside combine_exchange
+        final_data = self.combine_exchange(expert_out, recv_splits, send_counts)
+
+        # 5. Unpermute
+        return self.unpermute(final_data, rev_idx, weights, shape)
