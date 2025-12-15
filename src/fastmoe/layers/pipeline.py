@@ -6,7 +6,7 @@ from torch.profiler import record_function
 class PipelinedMoEBlock(nn.Module):
     def __init__(self, block_module, comm_stream):
         super().__init__()
-        # We wrap the existing Block
+        # 1. We share the layers from the original block
         self.attn = block_module.attn
         self.norm1 = block_module.norm1
         self.norm2 = block_module.norm2
@@ -16,121 +16,122 @@ class PipelinedMoEBlock(nn.Module):
 
     def forward(self, x):
         """
-        Input x: [B, T, D]
-        We assume B is divisible by 2 for the pipeline.
+        Hybrid Pipeline:
+        1. Full Batch Attention (Max Efficiency)
+        2. Micro-Batch MoE (Comm/Comp Overlap)
         """
         B, T, D = x.shape
 
-        # 1. Split Micro-Batch
-        chunks = x.chunk(2, dim=0)
+        # --- PHASE 1: STANDARD ATTENTION (Full Batch) ---
+        # No splitting here. Keep GPU saturated.
+        with record_function("Standard: Attention"):
+            residual = x
+            x = self.norm1(x)
+            x = self.attn(x)
+            x = x + residual
+
+        # --- PHASE 2: PIPELINED MOE ---
+        # Now we split because we need to hide the All-to-All latency
+        moe_input = self.norm2(x)
+
+        # Pre-allocate output tensor to avoid 'torch.cat' memory spike/copy
+        final_out = torch.empty_like(x)
+
+        # Split into 2 micro-batches
+        # We use 'view' slicing to avoid copying data
+        chunks = moe_input.chunk(2, dim=0)
         c1, c2 = chunks[0], chunks[1]
 
-        # Storage for intermediate results
-        c1_attn_out = None
-        c2_attn_out = None
+        # Slices for writing output
+        out_c1 = final_out.narrow(0, 0, B // 2)
+        out_c2 = final_out.narrow(0, B // 2, B // 2)
 
-        # Events for synchronization
-        ev_c1_attn_done = torch.cuda.Event()
-        ev_c2_attn_done = torch.cuda.Event()
-
-        ev_c1_dispatch_done = torch.cuda.Event()
-        ev_c2_dispatch_done = torch.cuda.Event()
-
-        ev_c1_compute_done = torch.cuda.Event()
-        ev_c2_compute_done = torch.cuda.Event()
-
-        # Metadata storage
+        # Metadata containers
         c1_meta = {}
         c2_meta = {}
 
-        # === PIPELINE STAGE 1: Attention C1 ===
-        with record_function("Pipe: Attn C1"):
-            c1_resid = c1
-            c1 = self.norm1(c1)
-            c1 = self.attn(c1)
-            c1 = c1 + c1_resid  # Add residual
-            c1_attn_out = c1
-            ev_c1_attn_done.record()
+        # Events
+        ev_dispatch_c1_done = torch.cuda.Event()
+        ev_compute_c1_done = torch.cuda.Event()
+        ev_dispatch_c2_done = torch.cuda.Event()
 
-        # === PIPELINE STAGE 2: Attention C2 || Dispatch C1 ===
+        # --- STEP 1: Process C1 (Dispatch) ---
+        # We do this on Main Stream to start the pipeline
+        with record_function("Pipe: Gate C1"):
+            perm1, sc1, rev1, w1, s1 = self.moe.gate_and_sort(c1)
+            c1_meta = {"rev": rev1, "w": w1, "s": s1, "sc": sc1}
 
-        # Stream 2 (Comm): Start working on C1 as soon as Attn C1 is done
+        # Comm Stream: Dispatch C1
         with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_event(ev_c1_attn_done)
+            self.comm_stream.wait_stream(torch.cuda.current_stream())
             with record_function("Pipe: Dispatch C1"):
-                # 1. Norm & Gate
-                moe_in = self.norm2(c1_attn_out)
-                permuted, send_counts, rev_idx, weights, shape = self.moe.gate_and_sort(moe_in)
-                c1_meta = {"rev": rev_idx, "w": weights, "s": shape, "sc": send_counts}
+                rd1, rc1 = self.moe.dispatch_exchange(perm1, sc1)
+                c1_meta["rd"] = rd1
+                c1_meta["rc"] = rc1
+            ev_dispatch_c1_done.record()
 
-                # 2. All-to-All Dispatch
-                recv_data, recv_splits = self.moe.dispatch_exchange(permuted, send_counts)
-                c1_meta["rc"] = recv_splits
-                c1_meta["rd"] = recv_data
-            ev_c1_dispatch_done.record()
+        # --- STEP 2: Process C2 (Gate) & Compute C1 ---
 
-        # Stream 1 (Compute): Do Attn C2
-        with record_function("Pipe: Attn C2"):
-            c2_resid = c2
-            c2 = self.norm1(c2)
-            c2 = self.attn(c2)
-            c2 = c2 + c2_resid
-            c2_attn_out = c2
-            ev_c2_attn_done.record()
+        # Main Stream: Gate C2 (Compute)
+        # This runs WHILE Dispatch C1 is happening on Comm Stream
+        with record_function("Pipe: Gate C2"):
+            perm2, sc2, rev2, w2, s2 = self.moe.gate_and_sort(c2)
+            c2_meta = {"rev": rev2, "w": w2, "s": s2, "sc": sc2}
 
-        # === PIPELINE STAGE 3: Compute C1 || Dispatch C2 ===
-
-        # Stream 2 (Comm): Start C2 Dispatch
-        with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_event(ev_c2_attn_done)
-            with record_function("Pipe: Dispatch C2"):
-                moe_in = self.norm2(c2_attn_out)
-                permuted, send_counts, rev_idx, weights, shape = self.moe.gate_and_sort(moe_in)
-                c2_meta = {"rev": rev_idx, "w": weights, "s": shape, "sc": send_counts}
-
-                recv_data, recv_splits = self.moe.dispatch_exchange(permuted, send_counts)
-                c2_meta["rc"] = recv_splits
-                c2_meta["rd"] = recv_data
-            ev_c2_dispatch_done.record()
-
-        # Stream 1 (Compute): Do MoE Compute C1
-        # Wait for data to arrive from Dispatch C1
-        torch.cuda.current_stream().wait_event(ev_c1_dispatch_done)
-
+        # Main Stream: Compute C1
+        # Must wait for Dispatch C1
+        torch.cuda.current_stream().wait_event(ev_dispatch_c1_done)
         with record_function("Pipe: Experts C1"):
-            expert_out = self.moe.compute_experts(c1_meta["rd"], c1_meta["rc"])
-            c1_meta["eo"] = expert_out
-        ev_c1_compute_done.record()
+            eo1 = self.moe.compute_experts(c1_meta["rd"], c1_meta["rc"])
+            c1_meta["eo"] = eo1
+        ev_compute_c1_done.record()
 
-        # === PIPELINE STAGE 4: Compute C2 || Combine C1 ===
+        # --- STEP 3: Dispatch C2 & Combine C1 ---
 
-        # Stream 2 (Comm): Combine C1 (Reverse All-to-All)
+        # Comm Stream: Dispatch C2 || Combine C1
         with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_event(ev_c1_compute_done)
+            # Wait for Gate C2 to be ready
+            self.comm_stream.wait_stream(torch.cuda.current_stream())
+
+            with record_function("Pipe: Dispatch C2"):
+                rd2, rc2 = self.moe.dispatch_exchange(perm2, sc2)
+                c2_meta["rd"] = rd2
+                c2_meta["rc"] = rc2
+            ev_dispatch_c2_done.record()
+
+            # Combine C1 (Reverse All-to-All)
+            # Must wait for Experts C1
+            self.comm_stream.wait_event(ev_compute_c1_done)
             with record_function("Pipe: Combine C1"):
-                final_data = self.moe.combine_exchange(c1_meta["eo"], c1_meta["rc"], c1_meta["sc"])
-                # Unpermute
-                out_c1 = self.moe.unpermute(final_data, c1_meta["rev"], c1_meta["w"], c1_meta["s"])
-                c1_meta["out"] = out_c1 + c1_attn_out  # Add Residual
+                fd1 = self.moe.combine_exchange(c1_meta["eo"], c1_meta["rc"], c1_meta["sc"])
+                # Unpermute can happen on Comm stream or Compute.
+                # Let's do it here to save main stream cycles.
+                res1 = self.moe.unpermute(fd1, c1_meta["rev"], c1_meta["w"], c1_meta["s"])
+                # Write directly to pre-allocated output
+                out_c1.copy_(res1)
 
-        # Stream 1 (Compute): Experts C2
-        torch.cuda.current_stream().wait_event(ev_c2_dispatch_done)
+        # --- STEP 4: Compute C2 ---
+
+        # Main Stream: Compute Experts C2
+        # Must wait for Dispatch C2
+        torch.cuda.current_stream().wait_event(ev_dispatch_c2_done)
         with record_function("Pipe: Experts C2"):
-            expert_out = self.moe.compute_experts(c2_meta["rd"], c2_meta["rc"])
-            c2_meta["eo"] = expert_out
-        ev_c2_compute_done.record()
+            eo2 = self.moe.compute_experts(c2_meta["rd"], c2_meta["rc"])
 
-        # === PIPELINE STAGE 5: Combine C2 ===
+        # --- STEP 5: Combine C2 ---
 
-        # We can do this on main stream now as we need to join
-        torch.cuda.current_stream().wait_event(ev_c2_compute_done)  # Ensure experts done
-        # Also need to make sure stream2 is done with C1 before we return everything
+        # Finalize on Main Stream (or Comm, but we need to join anyway)
+        # We need to make sure Comm stream is done with Combine C1 before we return
         torch.cuda.current_stream().wait_stream(self.comm_stream)
 
-        # Finish C2 on main stream
         with record_function("Pipe: Combine C2"):
-            final_data = self.moe.combine_exchange(c2_meta["eo"], c2_meta["rc"], c2_meta["sc"])
-            out_c2 = self.moe.unpermute(final_data, c2_meta["rev"], c2_meta["w"], c2_meta["s"])
-            out_c2 = out_c2 + c2_attn_out
+            fd2 = self.moe.combine_exchange(eo2, c2_meta["rc"], c2_meta["sc"])
+            res2 = self.moe.unpermute(fd2, c2_meta["rev"], c2_meta["w"], c2_meta["s"])
+            out_c2.copy_(res2)
 
-        return torch.cat([c1_meta["out"], out_c2], dim=0)
+        # Add residual connection (x is already moe_input + residual from attn)
+        # We need to be careful: 'moe_input' was x after norm.
+        # We want: output = x + MoE(Norm(x))
+        # 'final_out' currently contains MoE(Norm(x))
+
+        return x + final_out
