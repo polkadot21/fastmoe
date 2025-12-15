@@ -20,7 +20,8 @@ from fastmoe.models.tiny_model import TinyModel
 def setup():
     """Initializes the distributed process group."""
     if not dist.is_initialized():
-        # "env://" tells PyTorch to read MASTER_ADDR, RANK, etc. from environment
+        # [Fix] Use 127.0.0.1 explicitly to avoid IPv6/localhost ambiguity issues
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
         dist.init_process_group("nccl", init_method="env://")
 
     # Ensure we pin the correct device for this process
@@ -45,6 +46,9 @@ def benchmark_step(model, x, desc, profile_trace=False):
         _ = model(x)
     torch.cuda.synchronize()
 
+    # Reset Memory Stats for clean reading
+    torch.cuda.reset_peak_memory_stats()
+
     steps = 10
 
     if profile_trace:
@@ -62,7 +66,10 @@ def benchmark_step(model, x, desc, profile_trace=False):
                     out = model(x)
                     out.mean().backward()
                 prof.step()
-        return 0.0  # Timing not relevant during profiling
+
+        # Calculate Memory
+        peak_mem = torch.cuda.max_memory_allocated() / (1024**2)  # MB
+        return 0.0, peak_mem
     else:
         # Strict Timing
         start = torch.cuda.Event(enable_timing=True)
@@ -73,7 +80,10 @@ def benchmark_step(model, x, desc, profile_trace=False):
             out.mean().backward()
         end.record()
         torch.cuda.synchronize()
-        return start.elapsed_time(end) / steps
+
+        avg_time = start.elapsed_time(end) / steps
+        peak_mem = torch.cuda.max_memory_allocated() / (1024**2)  # MB
+        return avg_time, peak_mem
 
 
 def _worker_entrypoint():
@@ -84,14 +94,21 @@ def _worker_entrypoint():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # Config matching 2x H100 capacity
+    # [Fix] Override Config to create a Communication-Heavy Scenario
+    # Previous config (seq=4096, batch=4) was Compute Bound (Attention O(N^2)).
+    # We switch to DeepSeek-V3 style: Wide Hidden Dim, High Batch, Low Seq.
     cfg = get_config(MoEScale.GIGACHAT_10B)
+
+    cfg.hidden_dim = 16384  # Massive width (Increases Comm Payload)
+    cfg.seq_len = 128  # Shorter seq (Reduces Attention Compute to reveal Comm cost)
+    local_batch_size = 32  # Higher batch (Increases Comm Payload)
     cfg.num_experts = 8
-    local_batch_size = 4  # Divisible by 2 for pipeline
 
     if rank == 0:
         logger.info(f"Running Distributed Benchmark on {world_size} GPUs")
-        logger.info(f"Config: {cfg.scale.value} | Batch: {local_batch_size} | Seq: {cfg.seq_len}")
+        logger.info(
+            f"High-Bandwidth Config: Hidden={cfg.hidden_dim} | Batch={local_batch_size} | Seq={cfg.seq_len}"  # noqa
+        )
 
     device = torch.device(f"cuda:{rank}")
 
@@ -106,15 +123,15 @@ def _worker_entrypoint():
     )
 
     # ---------------------------------------------------------
-    # 1. STANDARD IMPLEMENTATION
+    # 1. STANDARD IMPLEMENTATION (Sequential EP)
     # ---------------------------------------------------------
     model_std = (
         TinyModel(
             in_dim=cfg.hidden_dim,
             dim=cfg.hidden_dim,
-            n_heads=16,
-            ff_dim=1024,
-            n_layers=2,
+            n_heads=32,
+            ff_dim=4096,
+            n_layers=2,  # n_heads increased for 16k dim
             num_experts=cfg.num_experts,
             implementation=MoEImplementation.FAST,
         )
@@ -127,7 +144,7 @@ def _worker_entrypoint():
         block.ff = (
             MoEFeedForward(
                 cfg.hidden_dim,
-                1024,
+                4096,
                 num_experts=cfg.num_experts,
                 implementation=MoEImplementation.FAST,
                 group=None,
@@ -138,22 +155,21 @@ def _worker_entrypoint():
 
     if rank == 0:
         logger.info("Benchmarking Standard (No Overlap)...")
-    # We do a quick timing run first, then profile
-    ms_std = benchmark_step(model_std, x, "standard_moe_timing", profile_trace=False)
-    benchmark_step(model_std, x, "standard_moe", profile_trace=True)  # Trace run
+    ms_std, mem_std = benchmark_step(model_std, x, "standard_moe_timing", profile_trace=False)
+    benchmark_step(model_std, x, "standard_moe", profile_trace=True)
 
     del model_std
     torch.cuda.empty_cache()
 
     # ---------------------------------------------------------
-    # 2. PIPELINED IMPLEMENTATION (OVERLAP)
+    # 2. PIPELINED IMPLEMENTATION (Overlap)
     # ---------------------------------------------------------
     model_pipe = (
         TinyModel(
             in_dim=cfg.hidden_dim,
             dim=cfg.hidden_dim,
-            n_heads=16,
-            ff_dim=1024,
+            n_heads=32,
+            ff_dim=4096,
             n_layers=2,
             num_experts=cfg.num_experts,
             implementation=MoEImplementation.FAST,
@@ -162,7 +178,7 @@ def _worker_entrypoint():
         .to(torch.bfloat16)
     )
 
-    # Create dedicated Comm Stream
+    # Create dedicated Comm Stream (High Priority to ensure it preempts if needed)
     comm_stream = torch.cuda.Stream(priority=-1)
 
     # Apply Patch
@@ -170,7 +186,7 @@ def _worker_entrypoint():
         dist_moe = (
             MoEFeedForward(
                 cfg.hidden_dim,
-                1024,
+                4096,
                 num_experts=cfg.num_experts,
                 implementation=MoEImplementation.FAST,
                 group=None,
@@ -185,29 +201,34 @@ def _worker_entrypoint():
 
     if rank == 0:
         logger.info("Benchmarking Fast (Pipelined Overlap)...")
-    ms_pipe = benchmark_step(model_pipe, x, "fast_moe_timing", profile_trace=False)
-    benchmark_step(model_pipe, x, "fast_moe", profile_trace=True)  # Trace run
+    ms_pipe, mem_pipe = benchmark_step(model_pipe, x, "fast_moe_timing", profile_trace=False)
+    benchmark_step(model_pipe, x, "fast_moe", profile_trace=True)
 
     if rank == 0:
-        logger.success(f"Standard: {ms_std:.2f} ms")
-        logger.success(f"Pipelined: {ms_pipe:.2f} ms")
-        logger.success(f"Speedup: {ms_std / ms_pipe:.2f}x")
+        logger.info("=" * 60)
+        logger.info(" BENCHMARK RESULTS ")
+        logger.info("=" * 60)
+        logger.info(f"{'Metric':<15} | {'Standard':<15} | {'Pipelined':<15} | {'Improvement':<15}")
+        logger.info("-" * 65)
+        logger.info(
+            f"{'Latency (ms)':<15} | {ms_std:<15.2f} | {ms_pipe:<15.2f} | {ms_std / ms_pipe:.2f}x Faster"  # noqa
+        )
+        logger.info(
+            f"{'Memory (MB)':<15} | {mem_std:<15.0f} | {mem_pipe:<15.0f} | {mem_std - mem_pipe:.0f} MB Saved"  # noqa
+        )
+        logger.info("=" * 60)
         logger.info("Traces saved to ./logs/standard_moe and ./logs/fast_moe")
 
     cleanup()
 
 
 # =============================================================================
-#  Launcher Logic (Notebook / Single Script Support)
+#  Launcher Logic
 # =============================================================================
 
 
 def _spawn_worker(rank, world_size):
-    """
-    The wrapper function passed to mp.spawn.
-    Sets up the environment variables needed by 'setup()'
-    """
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"  # [Fix] Hardcoded to avoid socket errors
     os.environ["MASTER_PORT"] = "12355"
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -221,22 +242,15 @@ def _spawn_worker(rank, world_size):
 
 
 def run_benchmark():
-    """
-    Public Entrypoint.
-    Auto-detects whether to run as a worker or spawn a cluster.
-    """
-    # 1. Check if we are already inside a distributed job (e.g. torchrun)
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         _worker_entrypoint()
         return
 
-    # 2. Notebook / Direct execution mode -> Spawn Processes
     world_size = torch.cuda.device_count()
     if world_size < 2:
         logger.warning(
             f"Detected {world_size} GPU. Pipeline Parallelism requires at least 2 for effective demo."  # noqa
         )
-        # Proceed anyway for debugging if user forces it
 
     logger.info(f"Spawning {world_size} workers for DeepSeek-V3 EP Benchmark...")
 
