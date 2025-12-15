@@ -90,7 +90,11 @@ class MoEFeedForward(nn.Module):
         self.router = nn.Linear(dim, num_experts, bias=False)
 
     def forward(
-        self, x: torch.Tensor, group=None, comm_stream=None, simulate_a2a_ms: float = 0.0
+        self,
+        x: torch.Tensor,
+        group=None,
+        comm_stream=None,
+        simulate_a2a_ms: float = 30.0,
     ) -> torch.Tensor:
         B, T, D = x.shape
         x_flat = x.view(-1, D)  # [BT, D]
