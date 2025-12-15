@@ -78,7 +78,6 @@ class MoEFeedForward(nn.Module):
         expert_counts = torch.bincount(expert_indices_sorted, minlength=self.num_experts)
 
         # 2. Reshape to [World_Size, Local_Experts] to get per-rank counts
-        # This tells us how many tokens we need to send to Rank 0, Rank 1, etc.
         if self.world_size > 1:
             rank_counts = expert_counts.view(self.world_size, self.num_local_experts).sum(dim=1)
         else:
@@ -97,7 +96,6 @@ class MoEFeedForward(nn.Module):
         dist.all_to_all_single(recv_counts, send_counts, group=self.group)
 
         # 2. Sync Point: We MUST move to CPU to allocate recv buffer.
-        # This is unavoidable without fixed padding, but we do it ONCE per chunk.
         send_list = send_counts.tolist()
         recv_list = recv_counts.tolist()
 
@@ -114,6 +112,7 @@ class MoEFeedForward(nn.Module):
             group=self.group,
         )
 
+        # Return send_list too so we don't have to .tolist() again later
         return recv_data, recv_list, send_list
 
     def compute_experts(self, recv_data, recv_splits):
@@ -139,12 +138,19 @@ class MoEFeedForward(nn.Module):
         if not results:
             return torch.empty(0, self.dim, device=recv_data.device, dtype=recv_data.dtype)
 
+        # Use torch.cat to preserve Autograd graph.
         return torch.cat(results, dim=0)
 
     def combine_exchange(self, expert_output, recv_splits, send_splits):
         """Stage 4: Reverse Communication"""
         if self.world_size == 1:
             return expert_output
+
+        # [OPTIMIZATION] Trust that send_splits is already a list (CPU).
+        # Do NOT call .tolist() here or you block the pipeline!
+        # If it happens to be a tensor (legacy call), convert it.
+        if isinstance(send_splits, torch.Tensor):
+            send_splits = send_splits.tolist()
 
         total_back = sum(send_splits)
         final_data = torch.empty(
@@ -166,15 +172,12 @@ class MoEFeedForward(nn.Module):
         D = self.dim
 
         if self.implementation == consts.MoEImplementation.STANDARD:
-            # Scale by gating weight
-            # Standard implementation uses index_add_ (atomic)
             x_out = x_out * sorted_weights.unsqueeze(-1)
             out = torch.zeros(B * T, D, device=x_out.device, dtype=x_out.dtype)
             out.index_add_(0, reverse_map_indices, x_out)
             return out.view(B, T, D)
         else:
             # Fast Kernel
-            # We treat 'x_out' as a list of 1 tensor for the kernel wrapper for simplicity
             out = grouped_weighted_scatter_add(
                 [x_out], reverse_map_indices, sorted_weights, (B * T, D)
             )
@@ -183,20 +186,18 @@ class MoEFeedForward(nn.Module):
     def forward(self, x):
         """
         Standard Sequential Forward Pass.
-        Used by the Non-Pipelined benchmark.
         """
         # 1. Gate
         permuted, send_counts, rev_idx, weights, shape = self.gate_and_sort(x)
 
         # 2. Dispatch
-        recv_data, recv_splits = self.dispatch_exchange(permuted, send_counts)
+        recv_data, recv_splits, send_splits_list = self.dispatch_exchange(permuted, send_counts)
 
         # 3. Compute
         expert_out = self.compute_experts(recv_data, recv_splits)
 
         # 4. Combine
-        # send_counts is a Tensor, we need list for comms usually, handled inside combine_exchange
-        final_data = self.combine_exchange(expert_out, recv_splits, send_counts)
+        final_data = self.combine_exchange(expert_out, recv_splits, send_splits_list)
 
         # 5. Unpermute
         return self.unpermute(final_data, rev_idx, weights, shape)
