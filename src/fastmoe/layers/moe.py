@@ -89,14 +89,15 @@ class MoEFeedForward(nn.Module):
     def dispatch_exchange(self, permuted_data, send_counts):
         """Stage 2: Communication (All-to-All)"""
         if self.world_size == 1:
-            return permuted_data, send_counts.tolist()
+            # Return send_counts as list for consistency
+            return permuted_data, send_counts.tolist(), send_counts.tolist()
 
-        # 1. Exchange counts (Small All-to-All) so we know how much to recv
-        # Note: In production, we often async handle this or pre-calculate if fixed load
+        # 1. Exchange counts
         recv_counts = torch.empty_like(send_counts)
         dist.all_to_all_single(recv_counts, send_counts, group=self.group)
 
-        # 2. Exchange Data (Heavy All-to-All)
+        # 2. Sync Point: We MUST move to CPU to allocate recv buffer.
+        # This is unavoidable without fixed padding, but we do it ONCE per chunk.
         send_list = send_counts.tolist()
         recv_list = recv_counts.tolist()
 
@@ -113,7 +114,7 @@ class MoEFeedForward(nn.Module):
             group=self.group,
         )
 
-        return recv_data, recv_list
+        return recv_data, recv_list, send_list
 
     def compute_experts(self, recv_data, recv_splits):
         """Stage 3: Computation"""
@@ -141,17 +142,9 @@ class MoEFeedForward(nn.Module):
         return torch.cat(results, dim=0)
 
     def combine_exchange(self, expert_output, recv_splits, send_splits):
-        """Stage 4: Reverse Communication (All-to-All)"""
+        """Stage 4: Reverse Communication"""
         if self.world_size == 1:
             return expert_output
-
-        # We need to send back what we processed.
-        # The output size matches the input size of the previous All-to-All recv.
-        # send_splits here refers to what WE sent originally (which is what we expect BACK)
-
-        # Note: send_splits is a tensor in gate, but we need list here
-        if isinstance(send_splits, torch.Tensor):
-            send_splits = send_splits.tolist()
 
         total_back = sum(send_splits)
         final_data = torch.empty(
