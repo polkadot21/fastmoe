@@ -38,7 +38,7 @@ def cleanup():
 # =============================================================================
 
 
-def benchmark_step(model, x, desc, profile_trace=False):
+def benchmark_step(model, x, desc, profile_trace=False) -> tuple[float, float]:
     # Warmup
     for _ in range(5):
         _ = model(x)
@@ -48,7 +48,6 @@ def benchmark_step(model, x, desc, profile_trace=False):
     steps = 10
 
     if profile_trace:
-        # --- PROFILING PASS (Trace Generation) ---
         log_path = f"./logs/{desc}"
         os.makedirs(log_path, exist_ok=True)
 
@@ -64,10 +63,9 @@ def benchmark_step(model, x, desc, profile_trace=False):
                 prof.step()
 
         # Return 0.0 for time because profiling overhead invalidates it.
-        # We only care about the trace file here.
         return 0.0, 0.0
+
     else:
-        # --- TIMING PASS (Strict Latency Measurement) ---
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
@@ -88,7 +86,7 @@ def _worker_entrypoint():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # [CONFIG] DeepSeek-V3 Proxy (Comm-Heavy)
+    # (Comm-Heavy)
     cfg = get_config(MoEScale.GIGACHAT_10B)
     cfg.hidden_dim = 8192
     cfg.seq_len = 64
@@ -144,9 +142,9 @@ def _worker_entrypoint():
     if rank == 0:
         logger.info("Benchmarking Standard...")
 
-    # [FIX] Run Timing Pass FIRST to get valid ms_std
+    # Run Timing Pass FIRST to get valid ms_std
     ms_std, mem_std = benchmark_step(model_std, x, "standard_moe_timing", profile_trace=False)
-    # [FIX] Run Profiling Pass SECOND (Optional, just for logs)
+    # Run Profiling Pass SECOND (Optional, just for logs)
     benchmark_step(model_std, x, "standard_moe", profile_trace=True)
 
     del model_std
@@ -189,9 +187,9 @@ def _worker_entrypoint():
     if rank == 0:
         logger.info("Benchmarking Fast (Pipelined)...")
 
-    # [FIX] Run Timing Pass FIRST to get valid ms_pipe
+    # Run Timing Pass FIRST to get valid ms_pipe
     ms_pipe, mem_pipe = benchmark_step(model_pipe, x, "fast_moe_timing", profile_trace=False)
-    # [FIX] Run Profiling Pass SECOND
+    # Run Profiling Pass SECOND
     benchmark_step(model_pipe, x, "fast_moe", profile_trace=True)
 
     if rank == 0:
@@ -240,6 +238,6 @@ def run_benchmark():
             f"Detected {world_size} GPU. Pipeline Parallelism requires at least 2 for effective demo."  # noqa
         )
 
-    logger.info(f"Spawning {world_size} workers for DeepSeek-V3 EP Benchmark...")
+    logger.info(f"Spawning {world_size} workers for EP Benchmark...")
 
     mp.spawn(_spawn_worker, args=(world_size,), nprocs=world_size, join=True)

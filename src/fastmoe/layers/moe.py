@@ -24,7 +24,6 @@ class MoEFeedForward(nn.Module):
         self.implementation = implementation
         self.group = group
 
-        # Distributed Setup
         if dist.is_initialized():
             self.world_size = dist.get_world_size(group)
             self.rank = dist.get_rank(group)
@@ -47,8 +46,10 @@ class MoEFeedForward(nn.Module):
             ]
         )
 
-    def gate_and_sort(self, x):
-        """Stage 1: Local Gating and Indices Calculation"""
+    def gate_and_sort(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Stage 1: Local Gating and Indices Calculation
+        """
         B, T, D = x.shape
         x_flat = x.view(-1, D)
 
@@ -86,16 +87,16 @@ class MoEFeedForward(nn.Module):
         return permuted_data, rank_counts, reverse_map_indices, sorted_weights, (B, T)
 
     def dispatch_exchange(self, permuted_data, send_counts):
-        """Stage 2: Communication (All-to-All)"""
+        """
+        Stage 2: Communication (All-to-All)
+        """
+
         if self.world_size == 1:
-            # Return send_counts as list for consistency
             return permuted_data, send_counts.tolist(), send_counts.tolist()
 
-        # 1. Exchange counts
         recv_counts = torch.empty_like(send_counts)
         dist.all_to_all_single(recv_counts, send_counts, group=self.group)
 
-        # 2. Sync Point: We MUST move to CPU to allocate recv buffer.
         send_list = send_counts.tolist()
         recv_list = recv_counts.tolist()
 
@@ -112,12 +113,13 @@ class MoEFeedForward(nn.Module):
             group=self.group,
         )
 
-        # Return send_list too so we don't have to .tolist() again later
         return recv_data, recv_list, send_list
 
-    def compute_experts(self, recv_data, recv_splits):
-        """Stage 3: Computation"""
-        # Hack for Benchmark: Distribute data evenly across local experts
+    def compute_experts(self, recv_data) -> torch.Tensor:
+        """
+        Stage 3: Computation
+        """
+
         chunk_size = recv_data.shape[0] // self.num_local_experts
         remainder = recv_data.shape[0] % self.num_local_experts
 
@@ -138,17 +140,16 @@ class MoEFeedForward(nn.Module):
         if not results:
             return torch.empty(0, self.dim, device=recv_data.device, dtype=recv_data.dtype)
 
-        # Use torch.cat to preserve Autograd graph.
         return torch.cat(results, dim=0)
 
     def combine_exchange(self, expert_output, recv_splits, send_splits):
-        """Stage 4: Reverse Communication"""
+        """
+        Stage 4: Reverse Communication
+        """
+
         if self.world_size == 1:
             return expert_output
 
-        # [OPTIMIZATION] Trust that send_splits is already a list (CPU).
-        # Do NOT call .tolist() here or you block the pipeline!
-        # If it happens to be a tensor (legacy call), convert it.
         if isinstance(send_splits, torch.Tensor):
             send_splits = send_splits.tolist()
 
@@ -166,7 +167,7 @@ class MoEFeedForward(nn.Module):
         )
         return final_data
 
-    def unpermute(self, x_out, reverse_map_indices, sorted_weights, original_shape):
+    def unpermute(self, x_out, reverse_map_indices, sorted_weights, original_shape) -> torch.Tensor:
         """Stage 5: Local Un-permute and Scatter"""
         B, T = original_shape
         D = self.dim
@@ -176,28 +177,19 @@ class MoEFeedForward(nn.Module):
             out = torch.zeros(B * T, D, device=x_out.device, dtype=x_out.dtype)
             out.index_add_(0, reverse_map_indices, x_out)
             return out.view(B, T, D)
-        else:
+
+        elif self.implementation == consts.MoEImplementation.FAST:
             # Fast Kernel
             out = grouped_weighted_scatter_add(
                 [x_out], reverse_map_indices, sorted_weights, (B * T, D)
             )
             return out.view(B, T, D)
 
-    def forward(self, x):
-        """
-        Standard Sequential Forward Pass.
-        """
-        # 1. Gate
+        raise NotImplementedError
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         permuted, send_counts, rev_idx, weights, shape = self.gate_and_sort(x)
-
-        # 2. Dispatch
         recv_data, recv_splits, send_splits_list = self.dispatch_exchange(permuted, send_counts)
-
-        # 3. Compute
         expert_out = self.compute_experts(recv_data, recv_splits)
-
-        # 4. Combine
         final_data = self.combine_exchange(expert_out, recv_splits, send_splits_list)
-
-        # 5. Unpermute
         return self.unpermute(final_data, rev_idx, weights, shape)

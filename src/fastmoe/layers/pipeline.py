@@ -20,7 +20,6 @@ class PipelinedMoEBlock(nn.Module):
         # --- PHASE 1: STANDARD ATTENTION ---
         # Keep full batch for max tensor core utilization
         with record_function("Standard: Attention"):
-            # Note: We don't save 'residual = x' yet to save memory pressure
             h = self.norm1(x)
             h = self.attn(h)
             x = x + h
@@ -55,17 +54,15 @@ class PipelinedMoEBlock(nn.Module):
                 "rev": rev1,
                 "w": w1,
                 "s": s1,
-            }  # We don't need sc1 tensor later if we have sl1
+            }
 
         with torch.cuda.stream(self.comm_stream):
             self.comm_stream.wait_stream(torch.cuda.current_stream())
             with record_function("Pipe: Dispatch C1"):
-                # [CRITICAL FIX] Capture send_list (sl1) here.
-                # This ensures we don't block CPU later waiting for .tolist()
                 rd1, rc1, sl1 = self.moe.dispatch_exchange(perm1, sc1)
                 c1_meta["rd"] = rd1
                 c1_meta["rc"] = rc1
-                c1_meta["sl"] = sl1  # Store CPU list
+                c1_meta["sl"] = sl1
             ev_dispatch_c1.record()
 
         # --- STEP 2: Process C2 & Compute C1 ---
@@ -87,7 +84,6 @@ class PipelinedMoEBlock(nn.Module):
         with torch.cuda.stream(self.comm_stream):
             self.comm_stream.wait_stream(torch.cuda.current_stream())
             with record_function("Pipe: Dispatch C2"):
-                # [CRITICAL FIX] Capture send_list (sl2)
                 rd2, rc2, sl2 = self.moe.dispatch_exchange(perm2, sc2)
                 c2_meta["rd"] = rd2
                 c2_meta["rc"] = rc2
@@ -98,22 +94,19 @@ class PipelinedMoEBlock(nn.Module):
             self.comm_stream.wait_event(ev_compute_c1)
 
             with record_function("Pipe: Combine C1"):
-                # [CRITICAL FIX] Use cached 'sl' (list). Do NOT use 'sc' (tensor).
-                # This prevents the CPU from blocking on a .tolist() call.
                 fd1 = self.moe.combine_exchange(c1_meta["eo"], c1_meta["rc"], c1_meta["sl"])
-                del c1_meta["eo"], c1_meta["rc"], c1_meta["sl"]  # Free heavy data
+                del c1_meta["eo"], c1_meta["rc"], c1_meta["sl"]
 
                 # Unpermute
                 res1 = self.moe.unpermute(fd1, c1_meta["rev"], c1_meta["w"], c1_meta["s"])
-                del fd1, c1_meta  # Free metadata
+                del fd1, c1_meta
 
         # --- STEP 4: Compute C2 ---
-        # The CPU proceeds here IMMEDIATELY because Step 3 didn't block it!
         torch.cuda.current_stream().wait_event(ev_dispatch_c2)
 
         with record_function("Pipe: Experts C2"):
             eo2 = self.moe.compute_experts(c2_meta["rd"], c2_meta["rc"])
-            del c2_meta["rd"]  # Only delete data
+            del c2_meta["rd"]
 
         # --- STEP 5: Combine C2 ---
         torch.cuda.current_stream().wait_stream(self.comm_stream)
@@ -123,9 +116,8 @@ class PipelinedMoEBlock(nn.Module):
             res2 = self.moe.unpermute(fd2, c2_meta["rev"], c2_meta["w"], c2_meta["s"])
             del fd2, c2_meta, eo2
 
-        # --- FINAL: Incremental Add ---
-        # Manually add residuals to each chunk.
-        # This keeps the peak memory lower than cat(res1, res2) + x.
+        # --- Incremental Add ---
+        # Add residuals to each chunk.
         out1 = res1 + c1_resid
         out2 = res2 + c2_resid
 
