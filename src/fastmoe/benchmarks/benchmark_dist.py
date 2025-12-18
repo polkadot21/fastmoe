@@ -168,6 +168,18 @@ def _worker_entrypoint():
         .to(torch.bfloat16)
     )
 
+    # 1. Compute Stream (High Prio)
+    comp_stream = torch.cuda.Stream()
+    # 2. Dispatch Stream
+    dispatch_stream = torch.cuda.Stream()
+    # 3. Combine Stream
+    combine_stream = torch.cuda.Stream()
+    # 4. Expert Stream (Low Prio)
+    expert_stream = torch.cuda.Stream(priority=-1)
+
+    # Bundle them
+    shared_streams = (comp_stream, dispatch_stream, combine_stream, expert_stream)
+
     for i, block in enumerate(model_pipe.blocks):
         dist_moe = (
             MoEFeedForward(
@@ -181,7 +193,10 @@ def _worker_entrypoint():
             .to(torch.bfloat16)
         )
         block.ff = dist_moe
-        model_pipe.blocks[i] = PipelinedMoEBlock(block, num_chunks=cfg.pipeline_chunks)
+
+        model_pipe.blocks[i] = PipelinedMoEBlock(
+            block, streams=shared_streams, num_chunks=cfg.pipeline_chunks, layer_idx=block.layer_idx
+        )
 
     if rank == 0:
         logger.info("Benchmarking Fast (Pipelined)...")

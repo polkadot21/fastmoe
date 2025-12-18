@@ -48,8 +48,10 @@ class Block(nn.Module):
         use_moe=True,
         num_experts=4,
         implementation=consts.MoEImplementation.FAST,
+        layer_idx=0,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.norm1 = nn.LayerNorm(dim)
         self.attn = MultiheadSelfAttention(dim, n_heads)
         self.norm2 = nn.LayerNorm(dim)
@@ -89,8 +91,9 @@ class TinyModel(nn.Module):
                     use_moe=True,
                     num_experts=num_experts,
                     implementation=implementation,
+                    layer_idx=i,
                 )
-                for _ in range(n_layers)
+                for i in range(n_layers)
             ]
         )
         self.out = nn.Linear(dim, in_dim, bias=False)
