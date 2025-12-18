@@ -11,7 +11,7 @@ class PipelinedMoEBlock(nn.Module):
         self.norm2 = block_module.norm2
         self.moe = block_module.ff
         self.comm_stream = comm_stream
-        self.num_chunks = num_chunks
+        self.default_num_chunks = num_chunks
 
     def forward(self, x):
         """
@@ -28,16 +28,22 @@ class PipelinedMoEBlock(nn.Module):
         while the GPU Link is dispatching C(i).
         """
 
-        # 1. Pre-Attention Chunking (Views, zero-copy)
-        chunks = x.chunk(self.num_chunks, dim=0)
+        # Determine chunks dynamically based on input batch size
+        # If batch is too small, fallback to fewer chunks or 1
+        num_chunks = self.default_num_chunks
+        if x.shape[0] < num_chunks:
+            num_chunks = 1
+
+        chunks = x.chunk(num_chunks, dim=0)
+        actual_num_chunks = len(chunks)
 
         # State Storage
-        chunk_meta = [{} for _ in range(self.num_chunks)]
-        final_results = [None] * self.num_chunks
+        chunk_meta = [{} for _ in range(actual_num_chunks)]
+        final_results = [None] * actual_num_chunks
 
-        # We need to track the async communication handles
-        dispatch_handles = [None] * self.num_chunks
-        combine_handles = [None] * self.num_chunks
+        # Track async communication handles
+        dispatch_handles = [None] * actual_num_chunks
+        combine_handles = [None] * actual_num_chunks
 
         # --- PIPELINE LOOP ---
         for i, x_chunk in enumerate(chunks):
@@ -61,11 +67,7 @@ class PipelinedMoEBlock(nn.Module):
                 del h, moe_input
 
             # 2. DISPATCH PREV CHUNK (Comm Heavy)
-            # While we just computed Attn for [i], we check if [i-1] is ready to dispatch
-            # Actually, we can start Dispatch for [i] IMMEDIATELY after gating.
-            # But to ensure overlap, we need to process "Experts of [i-1]" while "Dispatching [i]".
-
-            # > Start Dispatch for Current [i]
+            # We start Dispatch for [i] IMMEDIATELY after gating.
             with torch.cuda.stream(self.comm_stream):
                 # Wait for Gating [i] to complete on compute stream
                 self.comm_stream.wait_stream(torch.cuda.current_stream())
@@ -76,9 +78,11 @@ class PipelinedMoEBlock(nn.Module):
                     )
                     chunk_meta[i]["rd"] = rd
                     chunk_meta[i]["meta_dispatch"] = meta  # (counts, send_splits)
-                    dispatch_handles[i] = handle  # Can be None if world_size=1
+                    dispatch_handles[i] = handle
 
-                    del chunk_meta[i]["perm"], chunk_meta[i]["counts"]
+                    # We can clear these now to save memory
+                    chunk_meta[i]["perm"] = None
+                    chunk_meta[i]["counts"] = None
 
             # 3. COMPUTE EXPERTS PREV CHUNK
             prev_idx = i - 1
@@ -96,7 +100,7 @@ class PipelinedMoEBlock(nn.Module):
 
                     eo = self.moe.compute_experts(m_prev["rd"], recv_counts)
                     m_prev["eo"] = eo
-                    del m_prev["rd"]
+                    m_prev["rd"] = None  # Free memory
 
                 # > Start Combine for Prev [prev_idx]
                 with torch.cuda.stream(self.comm_stream):
@@ -109,14 +113,15 @@ class PipelinedMoEBlock(nn.Module):
                         )
                         m_prev["fd"] = fd
                         combine_handles[prev_idx] = handle
-                        del m_prev["eo"]
+                        m_prev["eo"] = None
 
         # --- DRAIN PIPELINE (Last Chunk) ---
-        last_idx = self.num_chunks - 1
+        last_idx = actual_num_chunks - 1
 
         # Wait for Dispatch Last
         if dispatch_handles[last_idx]:
             dispatch_handles[last_idx].wait()
+
         torch.cuda.current_stream().wait_stream(self.comm_stream)
 
         with record_function(f"Comp: Experts [{last_idx}]"):
@@ -124,7 +129,7 @@ class PipelinedMoEBlock(nn.Module):
             recv_counts, send_splits = m_last["meta_dispatch"]
             eo = self.moe.compute_experts(m_last["rd"], recv_counts)
             m_last["eo"] = eo
-            del m_last["rd"]
+            m_last["rd"] = None
 
         # Combine Last
         with torch.cuda.stream(self.comm_stream):
@@ -133,21 +138,21 @@ class PipelinedMoEBlock(nn.Module):
                 fd, handle = self.moe.combine_exchange_async(m_last["eo"], recv_counts, send_splits)
                 m_last["fd"] = fd
                 combine_handles[last_idx] = handle
-                del m_last["eo"]
+                m_last["eo"] = None
 
         # --- FINALIZE (Unpermute) ---
         # Wait for all combines to finish
-        for i in range(self.num_chunks):
+        for i in range(actual_num_chunks):
             if combine_handles[i]:
                 combine_handles[i].wait()
 
         # Ensure data is visible on compute stream
         torch.cuda.current_stream().wait_stream(self.comm_stream)
 
-        for i in range(self.num_chunks):
+        for i in range(actual_num_chunks):
             m = chunk_meta[i]
             res = self.moe.unpermute(m["fd"], m["rev"], m["w"], m["s"])
             final_results[i] = res + m["resid"]
-            del chunk_meta[i]
+            chunk_meta[i] = None
 
         return torch.cat(final_results, dim=0)
