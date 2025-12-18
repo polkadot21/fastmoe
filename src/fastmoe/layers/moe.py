@@ -47,9 +47,7 @@ class MoEFeedForward(nn.Module):
         )
 
     def gate_and_sort(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Stage 1: Local Gating and Indices Calculation
-        """
+        """Stage 1: Local Gating and Indices Calculation"""
         B, T, D = x.shape
         x_flat = x.view(-1, D)
 
@@ -74,122 +72,184 @@ class MoEFeedForward(nn.Module):
         # Permute input data to be grouped by expert
         permuted_data = x_flat[reverse_map_indices]
 
-        # Calculate splits for All-to-All
-        # 1. Count tokens per expert [Num_Experts]
+        # Count tokens per expert [Num_Experts]
+        # This is critical: we need the count per expert to know how to slice the received buffer
         expert_counts = torch.bincount(expert_indices_sorted, minlength=self.num_experts)
+        expert_counts = expert_counts.to(dtype=torch.long)
 
-        # 2. Reshape to [World_Size, Local_Experts] to get per-rank counts
-        if self.world_size > 1:
-            rank_counts = expert_counts.view(self.world_size, self.num_local_experts).sum(dim=1)
-        else:
-            rank_counts = torch.tensor([permuted_data.shape[0]], device=x.device, dtype=torch.long)
+        return permuted_data, expert_counts, reverse_map_indices, sorted_weights, (B, T)
 
-        return permuted_data, rank_counts, reverse_map_indices, sorted_weights, (B, T)
-
-    def dispatch_exchange(self, permuted_data, send_counts):
+    def dispatch_exchange_async(self, permuted_data, local_expert_counts):
         """
-        Stage 2: Communication (All-to-All)
+        Stage 2: Async Communication (Dispatch)
+        Returns: (recv_data, handle, (recv_counts_per_rank, send_splits))
         """
-
         if self.world_size == 1:
-            return permuted_data, send_counts.tolist(), send_counts.tolist()
+            # Fake handle for single GPU
+            return permuted_data, None, (local_expert_counts, local_expert_counts)
 
-        recv_counts = torch.empty_like(send_counts)
-        dist.all_to_all_single(recv_counts, send_counts, group=self.group)
+        # 1. Exchange Metadata (Blocking)
+        # We perform a blocking exchange of counts first to size the buffers.
+        # local_expert_counts is [Num_Experts]. Reshape to [World_Size, Local_Experts_Per_Rank]
+        send_counts_per_rank = local_expert_counts.view(self.world_size, self.num_local_experts)
+        recv_counts_per_rank = torch.empty_like(send_counts_per_rank)
 
-        send_list = send_counts.tolist()
-        recv_list = recv_counts.tolist()
+        # This is lightweight (integers only)
+        dist.all_to_all_single(recv_counts_per_rank, send_counts_per_rank, group=self.group)
 
-        total_recv = sum(recv_list)
+        send_splits = send_counts_per_rank.sum(dim=1).tolist()
+        recv_splits = recv_counts_per_rank.sum(dim=1).tolist()
+
+        total_recv = sum(recv_splits)
         recv_data = torch.empty(
             total_recv, self.dim, device=permuted_data.device, dtype=permuted_data.dtype
         )
 
-        dist.all_to_all_single(
+        # 2. Async Data Exchange
+        # Returns a Work handle. CPU continues immediately.
+        handle = dist.all_to_all_single(
             recv_data,
             permuted_data,
-            output_split_sizes=recv_list,
-            input_split_sizes=send_list,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
             group=self.group,
+            async_op=True,
         )
 
-        return recv_data, recv_list, send_list
+        # Return data + handle + metadata needed for next steps
+        return recv_data, handle, (recv_counts_per_rank, send_splits)
 
-    def compute_experts(self, recv_data) -> torch.Tensor:
+    def compute_experts(self, recv_data, counts) -> torch.Tensor:
         """
-        Stage 3: Computation
+        Stage 3: Batched Expert Computation
+        Args:
+            recv_data: The buffer received from All-to-All
+            counts: [World_Size, Num_Local_Experts] matrix of token counts
         """
+        # Flat counts to iterate through the linear recv_data buffer
+        flat_counts = counts.view(-1)
+        offsets = flat_counts.cumsum(0)
+        start_offsets = torch.cat(
+            (torch.zeros(1, device=recv_data.device, dtype=torch.long), offsets[:-1])
+        )
+        end_offsets = offsets
 
-        chunk_size = recv_data.shape[0] // self.num_local_experts
-        remainder = recv_data.shape[0] % self.num_local_experts
+        # We need to organize results by SOURCE rank for the return trip
+        results_by_rank = [[] for _ in range(self.world_size)]
 
-        offset = 0
-        results = []
-        for i, expert in enumerate(self.experts):
-            size = chunk_size + (1 if i < remainder else 0)
-            if size > 0:
-                chunk = recv_data[offset : offset + size]
-                out = expert(chunk)
-                results.append(out)
-            else:
-                results.append(
-                    torch.empty(0, self.dim, device=recv_data.device, dtype=recv_data.dtype)
-                )
-            offset += size
+        for local_expert_idx in range(self.num_local_experts):
+            # 1. Gather all tokens for this expert from ALL ranks
+            batch_chunks = []
+            chunk_sizes = []
 
-        if not results:
+            for rank in range(self.world_size):
+                # Calculate index in the flat buffer
+                # Layout is Rank-Major: Rank0_Exp0, Rank0_Exp1, ... Rank1_Exp0 ...
+                flat_idx = rank * self.num_local_experts + local_expert_idx
+
+                size = flat_counts[flat_idx].item()
+                chunk_sizes.append(size)
+
+                if size > 0:
+                    start = start_offsets[flat_idx].item()
+                    end = end_offsets[flat_idx].item()
+                    batch_chunks.append(recv_data[start:end])
+
+            if not batch_chunks:
+                continue
+
+            # 2. Compute (One big MatMul)
+            expert_input = torch.cat(batch_chunks, dim=0)
+            expert_output = self.experts[local_expert_idx](expert_input)
+
+            # 3. Scatter results back to their Source Ranks
+            active_sizes = [s for s in chunk_sizes if s > 0]
+            if active_sizes:
+                splitted_out = expert_output.split(active_sizes)
+                split_idx = 0
+                for rank, size in enumerate(chunk_sizes):
+                    if size > 0:
+                        results_by_rank[rank].append(splitted_out[split_idx])
+                        split_idx += 1
+
+        # 4. Concatenate by Rank
+        final_chunks = []
+        for rank_list in results_by_rank:
+            if rank_list:
+                final_chunks.append(torch.cat(rank_list, dim=0))
+
+        if not final_chunks:
             return torch.empty(0, self.dim, device=recv_data.device, dtype=recv_data.dtype)
 
-        return torch.cat(results, dim=0)
+        return torch.cat(final_chunks, dim=0)
 
-    def combine_exchange(self, expert_output, recv_splits, send_splits):
+    def combine_exchange_async(self, expert_output, recv_counts_matrix, send_splits):
         """
-        Stage 4: Reverse Communication
+        Stage 4: Reverse Async Communication (Combine)
+        Returns: (final_data, handle)
         """
-
         if self.world_size == 1:
-            return expert_output
+            return expert_output, None
 
-        if isinstance(send_splits, torch.Tensor):
-            send_splits = send_splits.tolist()
+        # "Output" for combine is what we received in Dispatch
+        output_splits = recv_counts_matrix.sum(dim=1).tolist()
 
-        total_back = sum(send_splits)
+        # "Input" for combine is what we sent in Dispatch
+        input_splits = send_splits
+
+        total_back = sum(input_splits)
         final_data = torch.empty(
             total_back, self.dim, device=expert_output.device, dtype=expert_output.dtype
         )
 
-        dist.all_to_all_single(
+        handle = dist.all_to_all_single(
             final_data,
             expert_output,
-            output_split_sizes=send_splits,
-            input_split_sizes=recv_splits,
+            output_split_sizes=input_splits,
+            input_split_sizes=output_splits,
             group=self.group,
+            async_op=True,
         )
-        return final_data
+        return final_data, handle
 
     def unpermute(self, x_out, reverse_map_indices, sorted_weights, original_shape) -> torch.Tensor:
-        """Stage 5: Local Un-permute and Scatter"""
+        """Stage 5: Local Un-permute"""
         B, T = original_shape
         D = self.dim
-
         if self.implementation == consts.MoEImplementation.STANDARD:
             x_out = x_out * sorted_weights.unsqueeze(-1)
             out = torch.zeros(B * T, D, device=x_out.device, dtype=x_out.dtype)
             out.index_add_(0, reverse_map_indices, x_out)
             return out.view(B, T, D)
-
         elif self.implementation == consts.MoEImplementation.FAST:
-            # Fast Kernel
             out = grouped_weighted_scatter_add(
                 [x_out], reverse_map_indices, sorted_weights, (B * T, D)
             )
             return out.view(B, T, D)
-
         raise NotImplementedError
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        permuted, send_counts, rev_idx, weights, shape = self.gate_and_sort(x)
-        recv_data, recv_splits, send_splits_list = self.dispatch_exchange(permuted, send_counts)
-        expert_out = self.compute_experts(recv_data, recv_splits)
-        final_data = self.combine_exchange(expert_out, recv_splits, send_splits_list)
+        """
+        Standard Forward Pass (Baseline).
+        Blocks on async handles to behave synchronously.
+        """
+        # 1. Gate
+        permuted, expert_counts, rev_idx, weights, shape = self.gate_and_sort(x)
+
+        # 2. Dispatch
+        recv_data, handle, (recv_counts, send_splits) = self.dispatch_exchange_async(
+            permuted, expert_counts
+        )
+        if handle:
+            handle.wait()  # Block if running standard benchmark
+
+        # 3. Compute
+        expert_out = self.compute_experts(recv_data, recv_counts)
+
+        # 4. Combine
+        final_data, handle = self.combine_exchange_async(expert_out, recv_counts, send_splits)
+        if handle:
+            handle.wait()  # Block if running standard benchmark
+
+        # 5. Unpermute
         return self.unpermute(final_data, rev_idx, weights, shape)
