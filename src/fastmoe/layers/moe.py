@@ -47,33 +47,26 @@ class MoEFeedForward(nn.Module):
         )
 
     def gate_and_sort(self, x: torch.Tensor) -> torch.Tensor:
-        """Stage 1: Local Gating and Indices Calculation"""
+        """Stage 1: Local Gating"""
         B, T, D = x.shape
         x_flat = x.view(-1, D)
 
-        # Router
         logits = self.router(x_flat)
         topk_weights, topk_indices = torch.topk(logits, self.top_k, dim=-1)
         topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).type_as(x)
 
-        # Flatten for routing
         indices_flat = topk_indices.view(-1)
         weights_flat = topk_weights.view(-1)
 
-        # Sort tokens by expert ID to make memory access contiguous
         sort_indices = torch.argsort(indices_flat)
         expert_indices_sorted = indices_flat[sort_indices]
 
-        # Mapping to restore original order later
         src_indices = torch.arange(x_flat.shape[0], device=x.device).repeat_interleave(self.top_k)
         reverse_map_indices = src_indices[sort_indices]
         sorted_weights = weights_flat[sort_indices]
 
-        # Permute input data to be grouped by expert
         permuted_data = x_flat[reverse_map_indices]
 
-        # Count tokens per expert [Num_Experts]
-        # This is critical: we need the count per expert to know how to slice the received buffer
         expert_counts = torch.bincount(expert_indices_sorted, minlength=self.num_experts)
         expert_counts = expert_counts.to(dtype=torch.long)
 
@@ -81,21 +74,23 @@ class MoEFeedForward(nn.Module):
 
     def dispatch_exchange_async(self, permuted_data, local_expert_counts):
         """
-        Stage 2: Async Communication (Dispatch)
-        Returns: (recv_data, handle, (recv_counts_per_rank, send_splits))
+        Stage 2: Async Communication
         """
         if self.world_size == 1:
             # Fake handle for single GPU
-            return permuted_data, None, (local_expert_counts, local_expert_counts)
+            return permuted_data, None, (local_expert_counts.tolist(), local_expert_counts.tolist())
 
         # 1. Exchange Metadata (Blocking)
-        # We perform a blocking exchange of counts first to size the buffers.
-        # local_expert_counts is [Num_Experts]. Reshape to [World_Size, Local_Experts_Per_Rank]
+        # We perform a blocking exchange of counts.
         send_counts_per_rank = local_expert_counts.view(self.world_size, self.num_local_experts)
         recv_counts_per_rank = torch.empty_like(send_counts_per_rank)
 
-        # This is lightweight (integers only)
         dist.all_to_all_single(recv_counts_per_rank, send_counts_per_rank, group=self.group)
+
+        # CPU SYNC POINT: We read the counts to CPU here.
+        # This is unavoidable for dynamic slicing, but doing it here prevents blocking in Stage 3.
+        # We return the LIST (CPU) to the pipeline, not the Tensor.
+        recv_counts_list = recv_counts_per_rank.view(-1).tolist()
 
         send_splits = send_counts_per_rank.sum(dim=1).tolist()
         recv_splits = recv_counts_per_rank.sum(dim=1).tolist()
@@ -106,7 +101,6 @@ class MoEFeedForward(nn.Module):
         )
 
         # 2. Async Data Exchange
-        # Returns a Work handle. CPU continues immediately.
         handle = dist.all_to_all_single(
             recv_data,
             permuted_data,
@@ -116,63 +110,61 @@ class MoEFeedForward(nn.Module):
             async_op=True,
         )
 
-        # Return data + handle + metadata needed for next steps
-        return recv_data, handle, (recv_counts_per_rank, send_splits)
+        return recv_data, handle, (recv_counts_list, send_splits)
 
-    def compute_experts(self, recv_data, counts) -> torch.Tensor:
+    def compute_experts(self, recv_data, flat_counts_list) -> torch.Tensor:
         """
         Stage 3: Batched Expert Computation
         Args:
-            recv_data: The buffer received from All-to-All
-            counts: [World_Size, Num_Local_Experts] matrix of token counts
+            recv_data: Flattened input tensor.
+            flat_counts_list: PYTHON LIST of ints. [Rank0_Exp0, Rank0_Exp1, ...].
+                              Using a list avoids .item() sync calls.
         """
-        # Flat counts to iterate through the linear recv_data buffer
-        flat_counts = counts.view(-1)
-        offsets = flat_counts.cumsum(0)
-        start_offsets = torch.cat(
-            (torch.zeros(1, device=recv_data.device, dtype=torch.long), offsets[:-1])
-        )
-        end_offsets = offsets
+        # We calculate offsets purely on CPU to generate slices
+        # This creates zero GPU sync overhead.
 
-        # We need to organize results by SOURCE rank for the return trip
         results_by_rank = [[] for _ in range(self.world_size)]
 
-        for local_expert_idx in range(self.num_local_experts):
-            # 1. Gather all tokens for this expert from ALL ranks
-            batch_chunks = []
-            chunk_sizes = []
+        current_offset = 0
 
-            for rank in range(self.world_size):
-                # Calculate index in the flat buffer
-                # Layout is Rank-Major: Rank0_Exp0, Rank0_Exp1, ... Rank1_Exp0 ...
-                flat_idx = rank * self.num_local_experts + local_expert_idx
+        # Iterate over Ranks (Outer) and Local Experts (Inner)
+        # The list is Rank-Major: [R0E0, R0E1, ... R1E0, R1E1 ...]
+        list_idx = 0
 
-                size = flat_counts[flat_idx].item()
-                chunk_sizes.append(size)
+        # Pre-calculate slices to avoid multiple passes
+        # Map: local_expert_idx -> list of (start, end, rank)
+        expert_slices = [[] for _ in range(self.num_local_experts)]
 
-                if size > 0:
-                    start = start_offsets[flat_idx].item()
-                    end = end_offsets[flat_idx].item()
-                    batch_chunks.append(recv_data[start:end])
+        for rank in range(self.world_size):
+            for local_exp in range(self.num_local_experts):
+                count = flat_counts_list[list_idx]
+                list_idx += 1
 
-            if not batch_chunks:
+                if count > 0:
+                    expert_slices[local_exp].append((current_offset, current_offset + count, rank))
+                    current_offset += count
+
+        # Now Execute Experts
+        for i, slices in enumerate(expert_slices):
+            if not slices:
                 continue
 
-            # 2. Compute (One big MatMul)
+            # 1. Gather Inputs (GPU Slicing - Non blocking)
+            batch_chunks = [recv_data[s:e] for s, e, r in slices]
+
+            # 2. Compute
             expert_input = torch.cat(batch_chunks, dim=0)
-            expert_output = self.experts[local_expert_idx](expert_input)
+            expert_output = self.experts[i](expert_input)
 
-            # 3. Scatter results back to their Source Ranks
-            active_sizes = [s for s in chunk_sizes if s > 0]
-            if active_sizes:
-                splitted_out = expert_output.split(active_sizes)
-                split_idx = 0
-                for rank, size in enumerate(chunk_sizes):
-                    if size > 0:
-                        results_by_rank[rank].append(splitted_out[split_idx])
-                        split_idx += 1
+            # 3. Split Output
+            chunk_sizes = [e - s for s, e, r in slices]
+            splitted_out = expert_output.split(chunk_sizes)
 
-        # 4. Concatenate by Rank
+            # 4. Sort into Rank Buckets
+            for j, (_, __, rank) in enumerate(slices):
+                results_by_rank[rank].append(splitted_out[j])
+
+        # Concatenate per rank
         final_chunks = []
         for rank_list in results_by_rank:
             if rank_list:
@@ -183,20 +175,22 @@ class MoEFeedForward(nn.Module):
 
         return torch.cat(final_chunks, dim=0)
 
-    def combine_exchange_async(self, expert_output, recv_counts_matrix, send_splits):
-        """
-        Stage 4: Reverse Async Communication (Combine)
-        Returns: (final_data, handle)
-        """
+    def combine_exchange_async(self, expert_output, recv_counts_list, send_splits):
+        """Stage 4: Reverse Async Communication"""
         if self.world_size == 1:
             return expert_output, None
 
-        # "Output" for combine is what we received in Dispatch
-        output_splits = recv_counts_matrix.sum(dim=1).tolist()
+        # Calculate splits from the CPU list
+        # recv_counts_list is [Rank0_Exp0, Rank0_Exp1 ...]
+        # We need to sum per rank.
+        output_splits = []
+        offset = 0
+        for _ in range(self.world_size):
+            rank_sum = sum(recv_counts_list[offset : offset + self.num_local_experts])
+            output_splits.append(rank_sum)
+            offset += self.num_local_experts
 
-        # "Input" for combine is what we sent in Dispatch
         input_splits = send_splits
-
         total_back = sum(input_splits)
         final_data = torch.empty(
             total_back, self.dim, device=expert_output.device, dtype=expert_output.dtype
@@ -229,27 +223,15 @@ class MoEFeedForward(nn.Module):
         raise NotImplementedError
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Standard Forward Pass (Baseline).
-        Blocks on async handles to behave synchronously.
-        """
-        # 1. Gate
+        """Standard Forward Pass"""
         permuted, expert_counts, rev_idx, weights, shape = self.gate_and_sort(x)
-
-        # 2. Dispatch
         recv_data, handle, (recv_counts, send_splits) = self.dispatch_exchange_async(
             permuted, expert_counts
         )
         if handle:
-            handle.wait()  # Block if running standard benchmark
-
-        # 3. Compute
+            handle.wait()
         expert_out = self.compute_experts(recv_data, recv_counts)
-
-        # 4. Combine
         final_data, handle = self.combine_exchange_async(expert_out, recv_counts, send_splits)
         if handle:
-            handle.wait()  # Block if running standard benchmark
-
-        # 5. Unpermute
+            handle.wait()
         return self.unpermute(final_data, rev_idx, weights, shape)
