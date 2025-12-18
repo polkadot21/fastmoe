@@ -55,6 +55,7 @@ def benchmark_step(model, x, desc, profile_trace=False) -> tuple[float, float]:
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(log_path),
+            with_stack=True,
         ) as prof:
             for i in range(steps):
                 with record_function(f"Model Step: {i}"):
@@ -96,7 +97,7 @@ def _worker_entrypoint():
     if rank == 0:
         logger.info(f"Running Distributed Benchmark on {world_size} GPUs")
         logger.info(
-            f"Workload: Hidden={cfg.hidden_dim} | Batch={local_batch_size} | Experts={cfg.num_experts}"  # noqa
+            f"Workload: Hidden={cfg.hidden_dim} | Batch={local_batch_size} | Experts={cfg.num_experts} | Chunks={cfg.pipeline_chunks}"  # noqa
         )
 
     device = torch.device(f"cuda:{rank}")
@@ -182,7 +183,7 @@ def _worker_entrypoint():
             .to(torch.bfloat16)
         )
         block.ff = dist_moe
-        model_pipe.blocks[i] = PipelinedMoEBlock(block, comm_stream)
+        model_pipe.blocks[i] = PipelinedMoEBlock(block, comm_stream, num_chunks=cfg.pipeline_chunks)
 
     if rank == 0:
         logger.info("Benchmarking Fast (Pipelined)...")

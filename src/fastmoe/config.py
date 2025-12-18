@@ -23,6 +23,8 @@ class MoESetup(BaseSettings):
     warmup_steps: int = 10
     active_steps: int = 50
 
+    pipeline_chunks: int = 2
+
     @property
     def total_tokens(self) -> int:
         return self.batch_size * self.seq_len * self.top_k
