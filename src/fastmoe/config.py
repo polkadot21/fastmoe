@@ -14,12 +14,19 @@ class MoEScale(str, Enum):
 
 class MoESetup(BaseSettings):
     scale: MoEScale = MoEScale.DEBUG
+
+    # Model
     batch_size: int = 4
     seq_len: int = 4096
     hidden_dim: int = 4096
+    n_heads: int = 32
+    ff_dim: int = 4096
+    n_layers: int = 2
 
+    # MoE
     num_experts: int = 8
     top_k: int = 2
+
     warmup_steps: int = 10
     active_steps: int = 50
 
