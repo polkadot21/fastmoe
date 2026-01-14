@@ -119,7 +119,7 @@ def _worker_entrypoint():
 
     # 2. PIPELINED
     stream0 = torch.cuda.Stream(device=device, priority=-1)
-    stream1 = torch.cuda.Stream(device=device, priority=-1)
+    stream1 = torch.cuda.Stream(device=device, priority=0)
 
     model_pipe = (
         TinyModel(
