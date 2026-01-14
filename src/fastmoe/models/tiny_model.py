@@ -19,16 +19,12 @@ class MultiheadSelfAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x):  # x: [B,T,D]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: [B,T,D]
         B, T, D = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.hd).transpose(1, 2)
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) / (self.hd**0.5)
-        att = att.softmax(dim=-1)
-        out = att @ v
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+
         out = out.transpose(1, 2).contiguous().view(B, T, D)
         return self.proj(out)
 
