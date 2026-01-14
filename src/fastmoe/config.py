@@ -67,7 +67,7 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
         return MoESetup(
             scale=MoEScale.GIGACHAT_10B,
             batch_size=32,  # High batch for compute intensity
-            seq_len=4096,
+            seq_len=2048,
             hidden_dim=8192,  # Wide layers to balance H100 NVLink speed
             num_experts=8,
             top_k=2,
@@ -76,8 +76,8 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
     elif scale == MoEScale.GIGACHAT_700B:
         return MoESetup(
             scale=MoEScale.GIGACHAT_700B,
-            batch_size=2,  # Reduced due to memory pressure
-            seq_len=4096,
+            batch_size=2,
+            seq_len=2048,
             hidden_dim=16384,  # Massive width
             num_experts=256,  # Extreme fragmentation
             top_k=4,  # Higher Top-K common at this scale

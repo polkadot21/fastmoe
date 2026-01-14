@@ -74,15 +74,14 @@ def _worker_entrypoint():
     world_size = dist.get_world_size()
 
     cfg = get_config(MoEScale.GIGACHAT_10B)
-    local_batch_size = 32
 
     if rank == 0:
         logger.info(f"Running Distributed Benchmark on {world_size} GPUs")
-        logger.info(f"Workload: Hidden={cfg.hidden_dim} | Batch={local_batch_size}")
+        logger.info(f"Workload: Hidden={cfg.hidden_dim} | Batch={cfg.batch_size}")
 
     device = torch.device(f"cuda:{rank}")
     x = torch.randn(
-        local_batch_size,
+        cfg.batch_size,
         cfg.seq_len,
         cfg.hidden_dim,
         device=device,
