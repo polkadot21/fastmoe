@@ -78,6 +78,7 @@ def _worker_entrypoint():
     if rank == 0:
         logger.info(f"Running Distributed Benchmark on {world_size} GPUs")
         logger.info(f"Workload: Hidden={cfg.hidden_dim} | Batch={cfg.batch_size}")
+        logger.info(f"Seq len: {cfg.seq_len}, N layers: {cfg.n_layers}")
 
     device = torch.device(f"cuda:{rank}")
     x = torch.randn(

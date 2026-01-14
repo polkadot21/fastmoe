@@ -66,7 +66,7 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
     elif scale == MoEScale.GIGACHAT_10B:
         return MoESetup(
             scale=MoEScale.GIGACHAT_10B,
-            batch_size=32,  # High batch for compute intensity
+            batch_size=16,
             seq_len=2048,
             hidden_dim=8192,  # Wide layers to balance H100 NVLink speed
             num_experts=8,
