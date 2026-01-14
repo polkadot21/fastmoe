@@ -30,6 +30,8 @@ class MoESetup(BaseSettings):
     warmup_steps: int = 10
     active_steps: int = 50
 
+    comm_balance_factor: int = 1
+
     @property
     def total_tokens(self) -> int:
         return self.batch_size * self.seq_len * self.top_k
@@ -71,6 +73,7 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
             hidden_dim=8192,  # Wide layers to balance H100 NVLink speed
             num_experts=8,
             top_k=2,
+            comm_balance_factor=4,
         )
 
     elif scale == MoEScale.GIGACHAT_700B:
