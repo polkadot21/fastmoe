@@ -84,51 +84,90 @@ class MoEFeedForward(nn.Module):
         indices_flat = topk_indices.view(-1)
         weights_flat = topk_weights.view(-1)
         sort_indices = torch.argsort(indices_flat)
+        expert_indices_sorted = indices_flat[sort_indices]
 
         src_indices = torch.arange(x_flat.shape[0], device=x.device).repeat_interleave(self.top_k)
         reverse_map_indices = src_indices[sort_indices]
         sorted_weights = weights_flat[sort_indices]
         permuted_data = x_flat[reverse_map_indices]
 
-        return permuted_data, reverse_map_indices, sorted_weights, (B, T)
+        # Calculate counts for Standard Implementation (ignored in Static Pipe)
+        global_expert_counts = torch.bincount(expert_indices_sorted, minlength=self.num_experts)
+
+        if self.world_size > 1:
+            expert_counts_by_rank = global_expert_counts.view(
+                self.world_size, self.num_local_experts
+            )
+            rank_counts = expert_counts_by_rank.sum(dim=1)
+        else:
+            expert_counts_by_rank = global_expert_counts.view(1, self.num_experts)
+            rank_counts = torch.tensor([permuted_data.shape[0]], device=x.device, dtype=torch.long)
+
+        return (
+            permuted_data,
+            rank_counts,
+            expert_counts_by_rank.to(dtype=torch.long),
+            reverse_map_indices,
+            sorted_weights,
+            (B, T),
+        )
+
+    def dispatch_exchange(self, permuted_data, send_rank_counts, send_expert_counts):
+        """Dynamic dispatch for Standard implementation"""
+        if self.world_size == 1:
+            local_tokens_per_expert = send_expert_counts.view(-1).tolist()
+            return (
+                permuted_data,
+                send_rank_counts.tolist(),
+                send_rank_counts.tolist(),
+                local_tokens_per_expert,
+            )
+
+        # 1. Metadata
+        recv_expert_counts = torch.empty_like(send_expert_counts)
+        dist.all_to_all_single(recv_expert_counts, send_expert_counts, group=self.group)
+        tokens_per_local_expert = recv_expert_counts.sum(dim=0).tolist()
+
+        # 2. Data
+        recv_rank_counts = torch.empty_like(send_rank_counts)
+        dist.all_to_all_single(recv_rank_counts, send_rank_counts, group=self.group)
+
+        send_list = send_rank_counts.tolist()
+        recv_list = recv_rank_counts.tolist()
+        total_recv = sum(recv_list)
+
+        recv_data = torch.empty(
+            total_recv, self.dim, device=permuted_data.device, dtype=permuted_data.dtype
+        )
+
+        dist.all_to_all_single(
+            recv_data,
+            permuted_data,
+            output_split_sizes=recv_list,
+            input_split_sizes=send_list,
+            group=self.group,
+        )
+
+        return recv_data, recv_list, send_list, tokens_per_local_expert
 
     def dispatch_exchange_static(self, permuted_data, static_splits, real_tokens_per_rank: int):
         """
-        Static Dispatch with Dead-Weight Padding.
+        Static Dispatch with Padding. Returns (data, splits, splits).
         """
         if self.world_size == 1:
             return permuted_data, static_splits, static_splits
 
         # 1. Prepare Padded Buffer
-        # static_splits are already scaled by comm_factor.
         total_send = sum(static_splits)
 
-        # If we are adding dead weight, we must allocate a larger buffer and copy real data in.
-        # This simulates "sending more data".
         if total_send > permuted_data.shape[0]:
-            # Allocate padded buffer
             send_data = torch.zeros(
                 total_send, self.dim, device=permuted_data.device, dtype=permuted_data.dtype
             )
-            # Copy real data to the start (so it arrives at the start of recv buffer)
-            # Since splits are even, we just fill the first N rows.
-            # Wait! All-to-All assumes contiguous chunks per rank.
-            # Real:   [R0_Data] [R1_Data] ...
-            # Padded: [R0_Data | Pad] [R1_Data | Pad] ...
-            # We must interleave the padding to respect the per-rank split!
-
-            # Reshape to [WorldSize, Padded_Per_Rank, Dim]
             padded_per_rank = static_splits[0]
             send_view = send_data.view(self.world_size, padded_per_rank, self.dim)
-
-            # Reshape source to [WorldSize, Real_Per_Rank, Dim]
-            # (Assuming input is perfectly sorted and balanced for static bench)
             src_view = permuted_data.view(self.world_size, real_tokens_per_rank, self.dim)
-
-            # Copy real data into the start of each rank's slot
             send_view[:, :real_tokens_per_rank, :] = src_view
-
-            # Flatten back for NCCL
             send_data = send_data.view(-1, self.dim)
         else:
             send_data = permuted_data
@@ -147,19 +186,27 @@ class MoEFeedForward(nn.Module):
         )
 
         # 3. Slice / Depad
-        # We received [R0_Data | Pad] [R1_Data | Pad]...
-        # We want to extract just the real data to compute on.
         if total_send > permuted_data.shape[0]:
             padded_per_rank = static_splits[0]
             recv_view = recv_data.view(self.world_size, padded_per_rank, self.dim)
-
-            # Slice out the real data
-            # [WorldSize, Real, Dim]
             real_recv = recv_view[:, :real_tokens_per_rank, :].reshape(-1, self.dim)
-            # Clone to ensure contiguous memory for compute efficiency (optional but good)
-            return real_recv.contiguous()
+            return real_recv.contiguous(), static_splits, static_splits
 
-        return recv_data
+        return recv_data, static_splits, static_splits
+
+    def compute_experts(self, recv_data, tokens_per_expert: list[int]) -> torch.Tensor:
+        chunks = recv_data.split(tokens_per_expert, dim=0)
+        results = []
+        for chunk, expert in zip(chunks, self.experts, strict=False):
+            if chunk.shape[0] > 0:
+                results.append(expert(chunk))
+            else:
+                results.append(
+                    torch.empty(0, self.dim, device=recv_data.device, dtype=recv_data.dtype)
+                )
+        if not results:
+            return torch.empty(0, self.dim, device=recv_data.device, dtype=recv_data.dtype)
+        return torch.cat(results, dim=0)
 
     def compute_experts_static(self, recv_data) -> torch.Tensor:
         chunks = recv_data.chunk(self.num_local_experts, dim=0)
@@ -173,33 +220,38 @@ class MoEFeedForward(nn.Module):
                 )
         return torch.cat(results, dim=0)
 
+    def combine_exchange(self, expert_output, recv_splits, send_splits):
+        if self.world_size == 1:
+            return expert_output
+
+        total_back = sum(send_splits)
+        final_data = torch.empty(
+            total_back, self.dim, device=expert_output.device, dtype=expert_output.dtype
+        )
+
+        dist.all_to_all_single(
+            final_data,
+            expert_output,
+            output_split_sizes=send_splits,
+            input_split_sizes=recv_splits,
+            group=self.group,
+        )
+        return final_data
+
     def combine_exchange_static(self, expert_output, static_splits, real_tokens_per_rank: int):
-        """
-        Static Combine with Dead-Weight Padding.
-        """
         if self.world_size == 1:
             return expert_output
 
         total_send = sum(static_splits)
-
-        # 1. Pad Output
         if total_send > expert_output.shape[0]:
             send_data = torch.zeros(
                 total_send, self.dim, device=expert_output.device, dtype=expert_output.dtype
             )
-            # SIMPLIFICATION:
-            # For `Combine`, we just want to burn wire time.
-            # We create a padded buffer, copy the `expert_output` to the *beginning*.
-            # This means Rank 0 gets all the real data + some garbage.
-            # Rank 1 gets garbage.
-            # This is mathematically WRONG for the result, but CORRECT for the bandwidth usage.
-            # Since this is a static benchmark for overlap, we prioritize the wire saturation.
-
+            # Simplification: Copy real data to start (See reasoning in previous turn)
             send_data[: expert_output.shape[0]] = expert_output
         else:
             send_data = expert_output
 
-        # 2. Exchange
         final_data_padded = torch.empty(
             total_send, self.dim, device=expert_output.device, dtype=expert_output.dtype
         )
@@ -212,11 +264,7 @@ class MoEFeedForward(nn.Module):
             group=self.group,
         )
 
-        # 3. Slice
         if total_send > expert_output.shape[0]:
-            # We just take the first N elements where we put the real data.
-            # (Again, numerically valid only for Rank 0 in this simplified padding scheme,
-            # but timing valid for everyone).
             return final_data_padded[: expert_output.shape[0]]
 
         return final_data_padded
@@ -235,6 +283,16 @@ class MoEFeedForward(nn.Module):
             )
             return out.view(B, T, D)
         raise NotImplementedError
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Standard Implementation
+        permuted, send_rank_counts, send_exp_counts, rev_idx, weights, shape = self.gate_and_sort(x)
+        recv_data, recv_splits, send_splits_list, tokens_per_expert = self.dispatch_exchange(
+            permuted, send_rank_counts, send_exp_counts
+        )
+        expert_out = self.compute_experts(recv_data, tokens_per_expert)
+        final_data = self.combine_exchange(expert_out, recv_splits, send_splits_list)
+        return self.unpermute(final_data, rev_idx, weights, shape)
 
 
 class Block(nn.Module):
@@ -274,6 +332,8 @@ class MoEBlock(nn.Module):
         )
 
     def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
         return x
 
 
@@ -313,12 +373,8 @@ class PipelinedMoEBlock(nn.Module):
             total_tokens = B * T * self.moe.top_k
             world_size = dist.get_world_size(self.moe.group)
 
-            # Real tokens per rank
             self.real_tokens_per_rank = total_tokens // world_size
-
-            # Padded tokens per rank (Multiply by balance factor)
             padded_tokens_per_rank = self.real_tokens_per_rank * self.comm_balance_factor
-
             self.static_splits = [padded_tokens_per_rank] * world_size
 
     def forward(self, x):
@@ -337,11 +393,12 @@ class PipelinedMoEBlock(nn.Module):
                 h0 = self.attn(h0)
                 mb0_resid = mb0 + h0
                 moe_in_0 = self.norm2(mb0_resid)
-                perm0, rev0, w0, s0 = self.moe.gate_and_sort(moe_in_0)
+                # Unpack 6, ignore middle 2
+                perm0, _, _, rev0, w0, s0 = self.moe.gate_and_sort(moe_in_0)
                 ctx0.update({"rev": rev0, "w": w0, "s": s0})
             ev_attn0_done.record()
 
-        # 2. S1 Attn (Staggered)
+        # 2. S1 Attn
         with torch.cuda.stream(self.stream1):
             self.stream1.wait_event(ev_attn0_done)
             with record_function("S1: Attn 1"):
@@ -349,10 +406,10 @@ class PipelinedMoEBlock(nn.Module):
                 h1 = self.attn(h1)
                 mb1_resid = mb1 + h1
                 moe_in_1 = self.norm2(mb1_resid)
-                perm1, rev1, w1, s1 = self.moe.gate_and_sort(moe_in_1)
+                perm1, _, _, rev1, w1, s1 = self.moe.gate_and_sort(moe_in_1)
                 ctx1.update({"rev": rev1, "w": w1, "s": s1})
 
-        # 3. S0 Dispatch (Padded)
+        # 3. S0 Dispatch (Static)
         with torch.cuda.stream(self.stream0):
             with record_function("S0: Dispatch 0"):
                 rd0, rc0, sl0 = self.moe.dispatch_exchange_static(
@@ -366,7 +423,7 @@ class PipelinedMoEBlock(nn.Module):
                 eo0 = self.moe.compute_experts_static(ctx0["rd"])
                 del ctx0["rd"]
 
-        # 5. S1 Dispatch (Padded)
+        # 5. S1 Dispatch
         with torch.cuda.stream(self.stream1):
             with record_function("S1: Dispatch 1"):
                 rd1, rc1, sl1 = self.moe.dispatch_exchange_static(
@@ -380,7 +437,7 @@ class PipelinedMoEBlock(nn.Module):
                 eo1 = self.moe.compute_experts_static(ctx1["rd"])
                 del ctx1["rd"]
 
-        # 7. S0 Combine (Padded)
+        # 7. S0 Combine
         with torch.cuda.stream(self.stream0):
             with record_function("S0: Combine 0"):
                 fd0 = self.moe.combine_exchange_static(
@@ -392,7 +449,7 @@ class PipelinedMoEBlock(nn.Module):
                 out0 = res0 + mb0_resid
                 del ctx0
 
-        # 8. S1 Combine (Padded)
+        # 8. S1 Combine
         with torch.cuda.stream(self.stream1):
             with record_function("S1: Combine 1"):
                 fd1 = self.moe.combine_exchange_static(
