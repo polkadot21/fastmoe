@@ -57,6 +57,7 @@ def test_full_model_integration():
         implementation=MoEImplementation.STANDARD,
         stream0=None,
         stream1=None,
+        stream2=None,
         comm_balance_factor=4,
         use_moe=True,
     )
@@ -72,6 +73,7 @@ def test_pipeline_cpu_mock():
     _, dim = 16, 32
     s0 = MockStream()
     s1 = MockStream()
+    s2 = MockStream()
 
     # Updated PipelinedMoEBlock args
     pipe_block = PipelinedMoEBlock(
@@ -82,6 +84,7 @@ def test_pipeline_cpu_mock():
         top_k=2,
         stream0=s0,
         stream1=s1,
+        stream2=s2,
         comm_balance_factor=1,
     )
 

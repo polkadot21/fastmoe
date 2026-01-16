@@ -471,9 +471,11 @@ class PipelinedMoEBlock(nn.Module):
         ff_dim: int,
         num_experts: int,
         top_k: int,
-        stream0: torch.cuda.Stream,  # Compute Stream
-        stream1: torch.cuda.Stream,  # Comm Stream (High Prio)
+        stream0: torch.cuda.Stream,  # Gate/Attn compute (HIGH prio recommended)
+        stream1: torch.cuda.Stream,  # Comm (LOW/NORMAL prio recommended)
+        stream2: torch.cuda.Stream,  # Expert stream
         comm_balance_factor: int = 1,
+        num_microbatches: int = 4,  # <<< increase to 8 if comm dominates
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -487,152 +489,144 @@ class PipelinedMoEBlock(nn.Module):
             implementation=consts.MoEImplementation.FAST,
         )
 
-        self.compute_stream = stream0
+        self.gate_stream = stream0
         self.comm_stream = stream1
+        # Separate stream so gate/attn can keep running even if experts wait on dispatch
+        self.expert_stream = stream2
 
         self.comm_balance_factor = comm_balance_factor
+        self.num_microbatches = num_microbatches
+
         self.static_splits = None
         self.real_tokens_per_rank = 0
 
-    def _init_static_splits(self, x_half):
-        if self.static_splits is None and dist.is_initialized():
-            B, T, D = x_half.shape
-            total_tokens = B * T * self.moe.top_k
-            world_size = dist.get_world_size(self.moe.group)
-            self.real_tokens_per_rank = total_tokens // world_size
-            padded_tokens_per_rank = self.real_tokens_per_rank * self.comm_balance_factor
-            self.static_splits = [padded_tokens_per_rank] * world_size
+    def _init_static_splits(self, x_mb):
+        if self.static_splits is not None:
+            return
+
+        B, T, _ = x_mb.shape
+        total_tokens = B * T * self.moe.top_k
+
+        if not dist.is_initialized():
+            # Single-rank fallback
+            self.real_tokens_per_rank = total_tokens
+            self.static_splits = [total_tokens]
+            return
+
+        world_size = dist.get_world_size(self.moe.group)
+        if world_size == 1:
+            self.real_tokens_per_rank = total_tokens
+            self.static_splits = [total_tokens]
+            return
+
+        self.real_tokens_per_rank = total_tokens // world_size
+        padded_tokens_per_rank = self.real_tokens_per_rank * self.comm_balance_factor
+        self.static_splits = [padded_tokens_per_rank] * world_size
 
     def forward(self, x):
-        x_chunks = x.chunk(2, dim=0)
-        mb0, mb1 = x_chunks[0], x_chunks[1]
-        self._init_static_splits(mb0)
+        mbs = x.chunk(self.num_microbatches, dim=0)
+        self._init_static_splits(mbs[0])
 
-        ctx0, ctx1 = {}, {}
+        n = len(mbs)
+        ctx = [{} for _ in range(n)]
+        outs = [None] * n
 
-        # Events
-        ev_gate0_done = torch.cuda.Event()
-        ev_gate1_done = torch.cuda.Event()
-        ev_dispatch0_done = torch.cuda.Event()
-        ev_dispatch1_done = torch.cuda.Event()
-        ev_experts0_done = torch.cuda.Event()
-        ev_experts1_done = torch.cuda.Event()
-        ev_combine_done = torch.cuda.Event()
+        # Events per microbatch
+        ev_gate_done = [torch.cuda.Event() for _ in range(n)]
+        ev_dispatch_done = [torch.cuda.Event() for _ in range(n)]
+        ev_expert_done = [torch.cuda.Event() for _ in range(n)]
+        ev_combine_done = [torch.cuda.Event() for _ in range(n)]
 
-        # -----------------------------------------------------------
-        # 1. COMPUTE: Gating 0
-        # -----------------------------------------------------------
-        with torch.cuda.stream(self.compute_stream):
-            with record_function("Comp: Attn/Gate 0"):
-                h0 = self.norm1(mb0)
-                h0 = self.attn(h0)
-                mb0_resid = mb0 + h0
-                moe_in_0 = self.norm2(mb0_resid)
-                perm0, _, _, rev0, w0, s0 = self.moe.gate_and_sort(moe_in_0)
-                ctx0.update({"rev": rev0, "w": w0, "s": s0})
-            ev_gate0_done.record()
+        # ---- Pipeline schedule (steady-state) ----
+        # For i:
+        #   Gate(i)           on gate_stream
+        #   Dispatch(i)       on comm_stream    (wait Gate(i))
+        #   Experts(i-1)      on expert_stream  (wait Dispatch(i-1))
+        #   Combine(i-1)      on comm_stream    (wait Experts(i-1))
+        #
+        # This preserves your “dispatch next before waiting on experts” intention,
+        # but avoids blocking future gates behind expert waits.
 
-        # -----------------------------------------------------------
-        # 2. COMM: Dispatch 0 (Submit BEFORE Attn 1)
-        # This fixes "Dispatch 0 waits for Attn 1"
-        # -----------------------------------------------------------
+        for i, mb in enumerate(mbs):
+            # 1) Gate/Attn i
+            with torch.cuda.stream(self.gate_stream):
+                with record_function(f"Comp: Attn/Gate {i}"):
+                    h = self.norm1(mb)
+                    h = self.attn(h)
+                    mb_resid = mb + h
+                    moe_in = self.norm2(mb_resid)
+                    perm, _, _, rev, w, s = self.moe.gate_and_sort(moe_in)
+                    ctx[i].update({"perm": perm, "rev": rev, "w": w, "s": s, "mb_resid": mb_resid})
+                ev_gate_done[i].record()
+
+            # 2) Dispatch i (queued early; comm stream waits for gate event)
+            with torch.cuda.stream(self.comm_stream):
+                self.comm_stream.wait_event(ev_gate_done[i])
+                with record_function(f"Comm: Dispatch {i}"):
+                    rd, _, _ = self.moe.dispatch_exchange_static(
+                        ctx[i]["perm"], self.static_splits, self.real_tokens_per_rank
+                    )
+                    # free send buffer early
+                    del ctx[i]["perm"]
+                    ctx[i]["rd"] = rd
+                ev_dispatch_done[i].record()
+
+            # 3) Experts (i-1)
+            j = i - 1
+            if j >= 0:
+                with torch.cuda.stream(self.expert_stream):
+                    self.expert_stream.wait_event(ev_dispatch_done[j])
+                    with record_function(f"Comp: Experts {j}"):
+                        eo = self.moe.compute_experts_static(ctx[j]["rd"])
+                        del ctx[j]["rd"]
+                        ctx[j]["eo"] = eo
+                    ev_expert_done[j].record()
+
+                # 4) Combine (i-1) AFTER we’ve already enqueued Dispatch(i)
+                with torch.cuda.stream(self.comm_stream):
+                    self.comm_stream.wait_event(ev_expert_done[j])
+                    with record_function(f"Comm: Combine {j}"):
+                        fd = self.moe.combine_exchange_static(
+                            ctx[j]["eo"], self.static_splits, self.real_tokens_per_rank
+                        )
+                        del ctx[j]["eo"]
+                        ctx[j]["fd"] = fd
+                    ev_combine_done[j].record()
+
+        # Flush last microbatch experts+combine
+        last = n - 1
+        with torch.cuda.stream(self.expert_stream):
+            self.expert_stream.wait_event(ev_dispatch_done[last])
+            with record_function(f"Comp: Experts {last}"):
+                eo = self.moe.compute_experts_static(ctx[last]["rd"])
+                del ctx[last]["rd"]
+                ctx[last]["eo"] = eo
+            ev_expert_done[last].record()
+
         with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_event(ev_gate0_done)
-            with record_function("Comm: Dispatch 0"):
-                rd0, rc0, sl0 = self.moe.dispatch_exchange_static(
-                    perm0, self.static_splits, self.real_tokens_per_rank
+            self.comm_stream.wait_event(ev_expert_done[last])
+            with record_function(f"Comm: Combine {last}"):
+                fd = self.moe.combine_exchange_static(
+                    ctx[last]["eo"], self.static_splits, self.real_tokens_per_rank
                 )
-                ctx0.update({"rd": rd0})
-            ev_dispatch0_done.record()
+                del ctx[last]["eo"]
+                ctx[last]["fd"] = fd
+            ev_combine_done[last].record()
 
-        # -----------------------------------------------------------
-        # 3. COMPUTE: Gating 1 (Runs parallel to Dispatch 0)
-        # -----------------------------------------------------------
-        with torch.cuda.stream(self.compute_stream):
-            with record_function("Comp: Attn/Gate 1"):
-                h1 = self.norm1(mb1)
-                h1 = self.attn(h1)
-                mb1_resid = mb1 + h1
-                moe_in_1 = self.norm2(mb1_resid)
-                perm1, _, _, rev1, w1, s1 = self.moe.gate_and_sort(moe_in_1)
-                ctx1.update({"rev": rev1, "w": w1, "s": s1})
-            ev_gate1_done.record()
+        # Finalize (unpermute + residual add)
+        with torch.cuda.stream(self.gate_stream):
+            for i in range(n):
+                self.gate_stream.wait_event(ev_combine_done[i])
+                with record_function(f"Comp: Finalize {i}"):
+                    res = self.moe.unpermute(ctx[i]["fd"], ctx[i]["rev"], ctx[i]["w"], ctx[i]["s"])
+                    out = res + ctx[i]["mb_resid"]
+                    outs[i] = out
+                    # cleanup
+                    del ctx[i]["fd"], ctx[i]["rev"], ctx[i]["w"], ctx[i]["s"], ctx[i]["mb_resid"]
 
-        # -----------------------------------------------------------
-        # 4. COMM: Dispatch 1 (Submit BEFORE Experts 0)
-        # -----------------------------------------------------------
-        with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_event(ev_gate1_done)
-            with record_function("Comm: Dispatch 1"):
-                rd1, rc1, sl1 = self.moe.dispatch_exchange_static(
-                    perm1, self.static_splits, self.real_tokens_per_rank
-                )
-                ctx1.update({"rd": rd1})
-            ev_dispatch1_done.record()
-
-        # -----------------------------------------------------------
-        # 5. COMPUTE: Experts 0 (Runs parallel to Dispatch 1)
-        # -----------------------------------------------------------
-        with torch.cuda.stream(self.compute_stream):
-            self.compute_stream.wait_event(ev_dispatch0_done)
-            with record_function("Comp: Experts 0"):
-                eo0 = self.moe.compute_experts_static(ctx0["rd"])
-                del ctx0["rd"]
-            ev_experts0_done.record()
-
-        # -----------------------------------------------------------
-        # 6. COMM: Combine 0 (Submit BEFORE Experts 1)
-        # -----------------------------------------------------------
-        with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_event(ev_experts0_done)
-            with record_function("Comm: Combine 0"):
-                fd0 = self.moe.combine_exchange_static(
-                    eo0, self.static_splits, self.real_tokens_per_rank
-                )
-                del eo0
-                ctx0["fd"] = fd0
-
-        # -----------------------------------------------------------
-        # 7. COMPUTE: Experts 1 (Runs parallel to Combine 0)
-        # -----------------------------------------------------------
-        with torch.cuda.stream(self.compute_stream):
-            self.compute_stream.wait_event(ev_dispatch1_done)
-            with record_function("Comp: Experts 1"):
-                eo1 = self.moe.compute_experts_static(ctx1["rd"])
-                del ctx1["rd"]
-            ev_experts1_done.record()
-
-        # -----------------------------------------------------------
-        # 8. COMM: Combine 1
-        # -----------------------------------------------------------
-        with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_event(ev_experts1_done)
-            with record_function("Comm: Combine 1"):
-                fd1 = self.moe.combine_exchange_static(
-                    eo1, self.static_splits, self.real_tokens_per_rank
-                )
-                del eo1
-                ctx1["fd"] = fd1
-
-        # Signal Comm stream done
-        self.comm_stream.record_event(ev_combine_done)
-
-        # -----------------------------------------------------------
-        # 9. FINALIZE (Compute Stream)
-        # -----------------------------------------------------------
-        with torch.cuda.stream(self.compute_stream):
-            self.compute_stream.wait_event(ev_combine_done)
-
-            with record_function("Comp: Finalize 0"):
-                res0 = self.moe.unpermute(ctx0["fd"], ctx0["rev"], ctx0["w"], ctx0["s"])
-                out0 = res0 + mb0_resid
-
-            with record_function("Comp: Finalize 1"):
-                res1 = self.moe.unpermute(ctx1["fd"], ctx1["rev"], ctx1["w"], ctx1["s"])
-                out1 = res1 + mb1_resid
-
-        torch.cuda.current_stream().wait_stream(self.compute_stream)
-        return torch.cat([out0, out1], dim=0)
+        # Make sure result is ready on the current stream
+        torch.cuda.current_stream().wait_stream(self.gate_stream)
+        return torch.cat(outs, dim=0)
 
 
 # ======= Model ========== #
@@ -649,6 +643,7 @@ class TinyModel(nn.Module):
         implementation: consts.MoEImplementation | None,
         stream0: torch.cuda.Stream | None,
         stream1: torch.cuda.Stream | None,
+        stream2: torch.cuda.Stream | None,
         comm_balance_factor: int = 1,
         *,
         use_moe: bool,
@@ -684,6 +679,7 @@ class TinyModel(nn.Module):
                         top_k=top_k,
                         stream0=stream0,
                         stream1=stream1,
+                        stream2=stream2,
                         comm_balance_factor=comm_balance_factor,
                     )
                     for _ in range(n_layers)

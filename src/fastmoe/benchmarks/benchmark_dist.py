@@ -103,6 +103,7 @@ def _worker_entrypoint():
             implementation=MoEImplementation.STANDARD,
             stream0=None,
             stream1=None,
+            stream2=None,
             comm_balance_factor=cfg.comm_balance_factor,
             use_moe=True,
         )
@@ -121,6 +122,7 @@ def _worker_entrypoint():
     # 2. PIPELINED
     stream0 = torch.cuda.Stream(device=device, priority=-1)
     stream1 = torch.cuda.Stream(device=device, priority=0)
+    stream2 = torch.cuda.Stream(device=device, priority=-1)
 
     model_pipe = (
         TinyModel(
@@ -134,6 +136,7 @@ def _worker_entrypoint():
             implementation=MoEImplementation.FAST,
             stream0=stream0,
             stream1=stream1,
+            stream2=stream2,
             comm_balance_factor=cfg.comm_balance_factor,
             use_moe=True,
         )
