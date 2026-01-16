@@ -73,7 +73,7 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
             hidden_dim=8192,  # Wide layers to balance H100 NVLink speed
             num_experts=8,
             top_k=2,
-            comm_balance_factor=4,
+            comm_balance_factor=8,
         )
 
     elif scale == MoEScale.GIGACHAT_700B:
