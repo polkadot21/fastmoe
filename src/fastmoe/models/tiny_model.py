@@ -471,8 +471,8 @@ class PipelinedMoEBlock(nn.Module):
         ff_dim: int,
         num_experts: int,
         top_k: int,
-        stream0: torch.cuda.Stream,  # We will treat this as COMPUTE STREAM
-        stream1: torch.cuda.Stream,  # We will treat this as COMM STREAM
+        stream0: torch.cuda.Stream,  # Compute Stream
+        stream1: torch.cuda.Stream,  # Comm Stream (High Prio)
         comm_balance_factor: int = 1,
     ) -> None:
         super().__init__()
@@ -487,9 +487,6 @@ class PipelinedMoEBlock(nn.Module):
             implementation=consts.MoEImplementation.FAST,
         )
 
-        # FUNCTIONAL STREAMS
-        # Stream 0 -> Compute (Calculations)
-        # Stream 1 -> Communication (NCCL)
         self.compute_stream = stream0
         self.comm_stream = stream1
 
@@ -507,31 +504,25 @@ class PipelinedMoEBlock(nn.Module):
             self.static_splits = [padded_tokens_per_rank] * world_size
 
     def forward(self, x):
-        """
-        Functional Stream Overlap:
-        Separates work into a Compute Lane and a Communication Lane.
-        """
         x_chunks = x.chunk(2, dim=0)
         mb0, mb1 = x_chunks[0], x_chunks[1]
         self._init_static_splits(mb0)
 
         ctx0, ctx1 = {}, {}
 
-        # Events for synchronization
-        # We need to signal across the two lanes.
+        # Events
         ev_gate0_done = torch.cuda.Event()
-        ev_dispatch0_done = torch.cuda.Event()
-        ev_experts0_done = torch.cuda.Event()
-
         ev_gate1_done = torch.cuda.Event()
+        ev_dispatch0_done = torch.cuda.Event()
         ev_dispatch1_done = torch.cuda.Event()
+        ev_experts0_done = torch.cuda.Event()
         ev_experts1_done = torch.cuda.Event()
+        ev_combine_done = torch.cuda.Event()
 
         # -----------------------------------------------------------
-        # STEP 1: PREPARE (Gating on Compute Stream)
+        # 1. COMPUTE: Gating 0
         # -----------------------------------------------------------
         with torch.cuda.stream(self.compute_stream):
-            # Gating MB0
             with record_function("Comp: Attn/Gate 0"):
                 h0 = self.norm1(mb0)
                 h0 = self.attn(h0)
@@ -541,7 +532,23 @@ class PipelinedMoEBlock(nn.Module):
                 ctx0.update({"rev": rev0, "w": w0, "s": s0})
             ev_gate0_done.record()
 
-            # Gating MB1
+        # -----------------------------------------------------------
+        # 2. COMM: Dispatch 0 (Submit BEFORE Attn 1)
+        # This fixes "Dispatch 0 waits for Attn 1"
+        # -----------------------------------------------------------
+        with torch.cuda.stream(self.comm_stream):
+            self.comm_stream.wait_event(ev_gate0_done)
+            with record_function("Comm: Dispatch 0"):
+                rd0, rc0, sl0 = self.moe.dispatch_exchange_static(
+                    perm0, self.static_splits, self.real_tokens_per_rank
+                )
+                ctx0.update({"rd": rd0})
+            ev_dispatch0_done.record()
+
+        # -----------------------------------------------------------
+        # 3. COMPUTE: Gating 1 (Runs parallel to Dispatch 0)
+        # -----------------------------------------------------------
+        with torch.cuda.stream(self.compute_stream):
             with record_function("Comp: Attn/Gate 1"):
                 h1 = self.norm1(mb1)
                 h1 = self.attn(h1)
@@ -552,23 +559,8 @@ class PipelinedMoEBlock(nn.Module):
             ev_gate1_done.record()
 
         # -----------------------------------------------------------
-        # STEP 2: PIPELINE LOOP (The Zig-Zag)
-        # We interleave submissions to ensure the GPU stays busy.
+        # 4. COMM: Dispatch 1 (Submit BEFORE Experts 0)
         # -----------------------------------------------------------
-
-        # [A] COMM STREAM: Dispatch MB0
-        with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_event(ev_gate0_done)  # Wait for data
-            with record_function("Comm: Dispatch 0"):
-                rd0, rc0, sl0 = self.moe.dispatch_exchange_static(
-                    perm0, self.static_splits, self.real_tokens_per_rank
-                )
-                ctx0.update({"rd": rd0})
-            ev_dispatch0_done.record()
-
-        # [B] COMM STREAM: Dispatch MB1
-        # We queue this immediately. It will run after Dispatch 0.
-        # Ideally, it runs *while* Experts 0 is running.
         with torch.cuda.stream(self.comm_stream):
             self.comm_stream.wait_event(ev_gate1_done)
             with record_function("Comm: Dispatch 1"):
@@ -578,9 +570,9 @@ class PipelinedMoEBlock(nn.Module):
                 ctx1.update({"rd": rd1})
             ev_dispatch1_done.record()
 
-        # [C] COMPUTE STREAM: Experts MB0
-        # This can start as soon as Dispatch 0 is done.
-        # It will overlap with Dispatch 1 (which is on Comm stream).
+        # -----------------------------------------------------------
+        # 5. COMPUTE: Experts 0 (Runs parallel to Dispatch 1)
+        # -----------------------------------------------------------
         with torch.cuda.stream(self.compute_stream):
             self.compute_stream.wait_event(ev_dispatch0_done)
             with record_function("Comp: Experts 0"):
@@ -588,20 +580,11 @@ class PipelinedMoEBlock(nn.Module):
                 del ctx0["rd"]
             ev_experts0_done.record()
 
-        # [D] COMPUTE STREAM: Experts MB1
-        # Overlaps with Combine 0 (below).
-        with torch.cuda.stream(self.compute_stream):
-            self.compute_stream.wait_event(ev_dispatch1_done)
-            with record_function("Comp: Experts 1"):
-                eo1 = self.moe.compute_experts_static(ctx1["rd"])
-                del ctx1["rd"]
-            ev_experts1_done.record()
-
-        # [E] COMM STREAM: Combine MB0
-        # Runs after Dispatch 1.
-        # Overlaps with Experts 1.
+        # -----------------------------------------------------------
+        # 6. COMM: Combine 0 (Submit BEFORE Experts 1)
+        # -----------------------------------------------------------
         with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_event(ev_experts0_done)  # Wait for result
+            self.comm_stream.wait_event(ev_experts0_done)
             with record_function("Comm: Combine 0"):
                 fd0 = self.moe.combine_exchange_static(
                     eo0, self.static_splits, self.real_tokens_per_rank
@@ -609,7 +592,19 @@ class PipelinedMoEBlock(nn.Module):
                 del eo0
                 ctx0["fd"] = fd0
 
-        # [F] COMM STREAM: Combine MB1
+        # -----------------------------------------------------------
+        # 7. COMPUTE: Experts 1 (Runs parallel to Combine 0)
+        # -----------------------------------------------------------
+        with torch.cuda.stream(self.compute_stream):
+            self.compute_stream.wait_event(ev_dispatch1_done)
+            with record_function("Comp: Experts 1"):
+                eo1 = self.moe.compute_experts_static(ctx1["rd"])
+                del ctx1["rd"]
+            ev_experts1_done.record()
+
+        # -----------------------------------------------------------
+        # 8. COMM: Combine 1
+        # -----------------------------------------------------------
         with torch.cuda.stream(self.comm_stream):
             self.comm_stream.wait_event(ev_experts1_done)
             with record_function("Comm: Combine 1"):
@@ -619,12 +614,11 @@ class PipelinedMoEBlock(nn.Module):
                 del eo1
                 ctx1["fd"] = fd1
 
-        # Signal Comm stream done so Compute stream can finalize
-        ev_combine_done = torch.cuda.Event()
+        # Signal Comm stream done
         self.comm_stream.record_event(ev_combine_done)
 
         # -----------------------------------------------------------
-        # STEP 3: FINALIZE (Compute Stream)
+        # 9. FINALIZE (Compute Stream)
         # -----------------------------------------------------------
         with torch.cuda.stream(self.compute_stream):
             self.compute_stream.wait_event(ev_combine_done)
