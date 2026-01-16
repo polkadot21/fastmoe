@@ -184,6 +184,9 @@ class MoEFeedForward(nn.Module):
             return out.view(B, T, D)
         raise NotImplementedError
 
+    def forward(self, x):
+        return x
+
 
 class Block(nn.Module):
     def __init__(self, dim: int, n_heads: int, ff_dim: int) -> None:
@@ -236,6 +239,7 @@ class PipelinedMoEBlock(nn.Module):
         top_k: int,
         stream0: torch.cuda.Stream,
         stream1: torch.cuda.Stream,
+        comm_balance_factor: int,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -251,7 +255,9 @@ class PipelinedMoEBlock(nn.Module):
         self.stream0 = stream0
         self.stream1 = stream1
 
+        self.comm_balance_factor = comm_balance_factor
         self.static_splits = None
+        self.real_tokens_per_rank = 0
 
     def _init_static_splits(self, x_half):
         """Initializes balanced split sizes once."""
@@ -262,8 +268,9 @@ class PipelinedMoEBlock(nn.Module):
 
             # Ensure perfect division for benchmark
             # In production, use padding or auxiliary load balancing loss
-            tokens_per_rank = total_tokens // world_size
-            self.static_splits = [tokens_per_rank] * world_size
+            self.real_tokens_per_rank = total_tokens // world_size
+            padded_tokens_per_rank = self.real_tokens_per_rank * self.comm_balance_factor
+            self.static_splits = [padded_tokens_per_rank] * world_size
 
     def forward(self, x):
         """
@@ -370,6 +377,7 @@ class TinyModel(nn.Module):
         implementation: consts.MoEImplementation | None,
         stream0: torch.cuda.Stream | None,
         stream1: torch.cuda.Stream | None,
+        comm_balance_factor: int,
         *,
         use_moe: bool,
     ):
@@ -404,6 +412,7 @@ class TinyModel(nn.Module):
                         top_k=top_k,
                         stream0=stream0,
                         stream1=stream1,
+                        comm_balance_factor=comm_balance_factor,
                     )
                     for _ in range(n_layers)
                 ]

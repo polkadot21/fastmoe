@@ -103,6 +103,7 @@ def _worker_entrypoint():
             implementation=MoEImplementation.STANDARD,
             stream0=None,
             stream1=None,
+            comm_balance_factor=cfg.comm_balance_factor,
             use_moe=True,
         )
         .to(device)
@@ -133,6 +134,7 @@ def _worker_entrypoint():
             implementation=MoEImplementation.FAST,
             stream0=stream0,
             stream1=stream1,
+            comm_balance_factor=cfg.comm_balance_factor,
             use_moe=True,
         )
         .to(device)

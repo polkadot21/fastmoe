@@ -57,6 +57,7 @@ def test_full_model_integration():
         implementation=MoEImplementation.STANDARD,
         stream0=None,
         stream1=None,
+        comm_balance_factor=4,
         use_moe=True,
     )
 
@@ -74,7 +75,14 @@ def test_pipeline_cpu_mock():
 
     # Updated PipelinedMoEBlock args
     pipe_block = PipelinedMoEBlock(
-        dim=dim, n_heads=4, ff_dim=64, num_experts=4, top_k=2, stream0=s0, stream1=s1
+        dim=dim,
+        n_heads=4,
+        ff_dim=64,
+        num_experts=4,
+        top_k=2,
+        stream0=s0,
+        stream1=s1,
+        comm_balance_factor=1,
     )
 
     x = torch.randn(4, 10, dim)
