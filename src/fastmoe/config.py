@@ -71,6 +71,8 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
             batch_size=16,
             seq_len=2048,
             hidden_dim=8192,  # Wide layers to balance H100 NVLink speed
+            ff_dim=16384,
+            # MoE
             num_experts=8,
             top_k=2,
             comm_balance_factor=8,
