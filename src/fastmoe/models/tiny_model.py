@@ -392,7 +392,7 @@ class PipelinedMoEBlock(nn.Module):
         stream1: torch.cuda.Stream,  # Comm (LOW/NORMAL prio recommended)
         stream2: torch.cuda.Stream,  # Expert stream
         comm_balance_factor: int = 1,
-        num_microbatches: int = 4,  # <<< increase to 8 if comm dominates
+        num_microbatches: int = 2,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
