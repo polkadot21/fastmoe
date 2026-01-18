@@ -16,17 +16,18 @@ from fastmoe.models.tiny_model import TinyModel
 
 
 def setup():
-    # Env must already be set by _spawn_worker (RANK/WORLD_SIZE/LOCAL_RANK)
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
-
-    # 1) Pick GPU FIRST
     torch.cuda.set_device(local_rank)
 
-    # 2) Then init NCCL
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "12355")
+
     if not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "12355")
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            device_id=local_rank,
+        )
 
     dist.barrier()
 

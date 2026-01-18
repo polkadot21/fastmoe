@@ -140,19 +140,25 @@ class MoEFeedForward(nn.Module):
         global_expert_counts = torch.bincount(expert_indices_sorted, minlength=self.num_experts)
         global_expert_counts = global_expert_counts.to(torch.int32)
 
-        if self.world_size > 1:
-            # Reshape counts to map Global Experts -> Ranks.
-            # Example: If Rank 0 hosts Experts [0,1] and Rank 1 hosts [2,3].
-            # Shape: [World_Size, Num_Local_Experts]
-            expert_counts_by_rank = global_expert_counts.view(
-                self.world_size, self.num_local_experts
-            )
-            # Sum local expert counts to get the total number of tokens to send to each Rank.
-            # This is required for the NCCL all_to_all_single communication size.
-            # Shape: [World_Size]
-            rank_counts = expert_counts_by_rank.sum(dim=1).contiguous()
-        else:
-            expert_counts_by_rank = global_expert_counts.view(1, self.num_experts).contiguous()
+        # Experts are laid out contiguously per rank:
+        # rank = expert_id // num_local_experts
+        assert (
+            self.num_experts % self.world_size == 0
+        ), "num_experts must be divisible by world_size"
+        rank_ids = (expert_indices_sorted // self.num_local_experts).to(torch.int64)
+        rank_counts = torch.bincount(rank_ids, minlength=self.world_size).to(
+            torch.int32
+        )  # shape [world_size]
+
+        # Per-rank per-local-expert matrix (shape [world_size, num_local_experts])
+        expert_counts_by_rank = global_expert_counts.view(
+            self.world_size, self.num_local_experts
+        ).contiguous()
+
+        # Sanity: make it fail fast if something goes wrong
+        assert rank_counts.numel() == self.world_size
+        assert expert_counts_by_rank.shape == (self.world_size, self.num_local_experts)
+
         rank_counts = torch.tensor([permuted_data.shape[0]], device=x.device, dtype=torch.int32)
 
         return (
@@ -167,34 +173,44 @@ class MoEFeedForward(nn.Module):
         )
 
     def dispatch_exchange(self, permuted_data, send_rank_counts, send_expert_counts):
-        if self.world_size == 1:
-            local_tokens_per_expert = send_expert_counts.view(-1).to(torch.int64).tolist()
-            return (
-                permuted_data,
-                [int(send_rank_counts.item())],
-                [int(send_rank_counts.item())],
-                local_tokens_per_expert,
-            )
+        # Metadata: enforce int32 + contiguous + 1D/2D expected shapes
+        send_rank_counts = send_rank_counts.to(torch.int32).contiguous().view(-1)
+        assert (
+            send_rank_counts.numel() == self.world_size
+        ), f"send_rank_counts wrong shape: {tuple(send_rank_counts.shape)}"
 
         send_expert_counts = send_expert_counts.to(torch.int32).contiguous()
-        send_rank_counts = send_rank_counts.to(torch.int32).contiguous()
+        assert send_expert_counts.shape == (
+            self.world_size,
+            self.num_local_experts,
+        ), f"send_expert_counts wrong shape: {tuple(send_expert_counts.shape)}"
 
+        # 1) exchange expert-count matrix
         recv_expert_counts = torch.empty_like(send_expert_counts)
         dist.all_to_all_single(recv_expert_counts, send_expert_counts, group=self.group)
-
         tokens_per_local_expert = recv_expert_counts.sum(dim=0).to(torch.int64).tolist()
 
+        # 2) exchange rank counts vector
         recv_rank_counts = torch.empty_like(send_rank_counts)
         dist.all_to_all_single(recv_rank_counts, send_rank_counts, group=self.group)
 
-        send_list = send_rank_counts.to(torch.int64).tolist()
-        recv_list = recv_rank_counts.to(torch.int64).tolist()
+        # Build split lists on CPU (and assert lengths)
+        send_list = send_rank_counts.cpu().to(torch.int64).tolist()
+        recv_list = recv_rank_counts.cpu().to(torch.int64).tolist()
+
+        assert (
+            len(send_list) == self.world_size
+        ), f"len(send_list)={len(send_list)} ws={self.world_size}"
+        assert (
+            len(recv_list) == self.world_size
+        ), f"len(recv_list)={len(recv_list)} ws={self.world_size}"
 
         total_recv = sum(recv_list)
         recv_data = torch.empty(
             total_recv, self.dim, device=permuted_data.device, dtype=permuted_data.dtype
         )
 
+        # 3) data all-to-all
         dist.all_to_all_single(
             recv_data,
             permuted_data,
