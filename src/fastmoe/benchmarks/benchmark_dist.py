@@ -16,11 +16,19 @@ from fastmoe.models.tiny_model import TinyModel
 
 
 def setup():
-    if not dist.is_initialized():
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        dist.init_process_group("nccl", init_method="env://")
+    # Env must already be set by _spawn_worker (RANK/WORLD_SIZE/LOCAL_RANK)
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+
+    # 1) Pick GPU FIRST
     torch.cuda.set_device(local_rank)
+
+    # 2) Then init NCCL
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "12355")
+        dist.init_process_group(backend="nccl", init_method="env://")
+
+    dist.barrier()
 
 
 def cleanup():
@@ -80,7 +88,8 @@ def _worker_entrypoint():
         logger.info(f"Workload: Hidden={cfg.hidden_dim} | Batch={cfg.batch_size}")
         logger.info(f"Seq len: {cfg.seq_len}, N layers: {cfg.n_layers}")
 
-    device = torch.device(f"cuda:{rank}")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device("cuda", local_rank)
     x = torch.randn(
         cfg.batch_size,
         cfg.seq_len,

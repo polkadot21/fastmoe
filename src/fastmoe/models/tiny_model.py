@@ -63,6 +63,8 @@ class MoEFeedForward(nn.Module):
             self.world_size = 1
             self.rank = 0
 
+        assert num_experts % self.world_size == 0
+
         self.num_local_experts = num_experts // self.world_size
         self.router = nn.Linear(dim, num_experts, bias=False)
         self.experts = nn.ModuleList(
@@ -136,6 +138,7 @@ class MoEFeedForward(nn.Module):
         # Count how many tokens are assigned to each global expert.
         # Shape: [Num_Experts]
         global_expert_counts = torch.bincount(expert_indices_sorted, minlength=self.num_experts)
+        global_expert_counts = global_expert_counts.to(torch.int32)
 
         if self.world_size > 1:
             # Reshape counts to map Global Experts -> Ranks.
@@ -147,10 +150,10 @@ class MoEFeedForward(nn.Module):
             # Sum local expert counts to get the total number of tokens to send to each Rank.
             # This is required for the NCCL all_to_all_single communication size.
             # Shape: [World_Size]
-            rank_counts = expert_counts_by_rank.sum(dim=1)
+            rank_counts = expert_counts_by_rank.sum(dim=1).contiguous()
         else:
-            expert_counts_by_rank = global_expert_counts.view(1, self.num_experts)
-            rank_counts = torch.tensor([permuted_data.shape[0]], device=x.device, dtype=torch.long)
+            expert_counts_by_rank = global_expert_counts.view(1, self.num_experts).contiguous()
+        rank_counts = torch.tensor([permuted_data.shape[0]], device=x.device, dtype=torch.int32)
 
         return (
             permuted_data,  # The sorted token data [B*T*k, D]
@@ -164,49 +167,34 @@ class MoEFeedForward(nn.Module):
         )
 
     def dispatch_exchange(self, permuted_data, send_rank_counts, send_expert_counts):
-        """Dynamic dispatch for Standard implementation"""
         if self.world_size == 1:
-            local_tokens_per_expert = send_expert_counts.view(-1).tolist()
+            local_tokens_per_expert = send_expert_counts.view(-1).to(torch.int64).tolist()
             return (
                 permuted_data,
-                send_rank_counts.tolist(),
-                send_rank_counts.tolist(),
+                [int(send_rank_counts.item())],
+                [int(send_rank_counts.item())],
                 local_tokens_per_expert,
             )
-        # 1. METADATA EXCHANGE
-        # We need to know how many tokens we will receive for each of our local experts.
-        # send_expert_counts: [World_Size, Num_Local_Experts]
+
+        send_expert_counts = send_expert_counts.to(torch.int32).contiguous()
+        send_rank_counts = send_rank_counts.to(torch.int32).contiguous()
+
         recv_expert_counts = torch.empty_like(send_expert_counts)
-        # All-to-All for metadata. This is a small, blocking communication.
-        # Each rank tells every other rank: "I have X tokens for your Expert Y."
         dist.all_to_all_single(recv_expert_counts, send_expert_counts, group=self.group)
 
-        # Aggregate counts to determine how to split the incoming data buffer.
-        # Summing over dimension 0 (ranks) gives total tokens for each local expert.
-        # Shape: [Num_Local_Experts] (as a Python list for torch.split)
-        tokens_per_local_expert = recv_expert_counts.sum(dim=0).tolist()
+        tokens_per_local_expert = recv_expert_counts.sum(dim=0).to(torch.int64).tolist()
 
-        # 2. DATA EXCHANGE SETUP
-        # We need to know the total size of the incoming data buffer from each rank.
-        # recv_rank_counts: [World_Size]
         recv_rank_counts = torch.empty_like(send_rank_counts)
-        # All-to-All for data sizes.
-        # Each rank tells every other rank: "I am sending you N total tokens."
         dist.all_to_all_single(recv_rank_counts, send_rank_counts, group=self.group)
-        # Prepare list for NCCL split sizes.
-        # send_list: [World_Size], recv_list: [World_Size]
-        send_list = send_rank_counts.tolist()
-        recv_list = recv_rank_counts.tolist()
-        # Calculate total receive buffer size to allocate memory.
+
+        send_list = send_rank_counts.to(torch.int64).tolist()
+        recv_list = recv_rank_counts.to(torch.int64).tolist()
+
         total_recv = sum(recv_list)
-        # Allocate the receiving buffer.
-        # Shape: [Total_Recv_Tokens, Hidden_Dim]
         recv_data = torch.empty(
             total_recv, self.dim, device=permuted_data.device, dtype=permuted_data.dtype
         )
-        # 3. DATA EXCHANGE (HEAVY LIFTING)
-        # Perform the actual token transfer.
-        # This moves the bulk of the data across NVLink/Infiniband.
+
         dist.all_to_all_single(
             recv_data,
             permuted_data,
@@ -214,7 +202,6 @@ class MoEFeedForward(nn.Module):
             input_split_sizes=send_list,
             group=self.group,
         )
-
         return recv_data, recv_list, send_list, tokens_per_local_expert
 
     def dispatch_exchange_static(self, permuted_data, static_splits, real_tokens_per_rank: int):
