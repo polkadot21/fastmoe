@@ -64,8 +64,8 @@ class MoEFeedForward(nn.Module):
             self.rank = 0
 
         assert num_experts % self.world_size == 0
-
         self.num_local_experts = num_experts // self.world_size
+
         self.router = nn.Linear(dim, num_experts, bias=False)
         self.experts = nn.ModuleList(
             [
@@ -81,99 +81,89 @@ class MoEFeedForward(nn.Module):
     def gate_and_sort(self, x: torch.Tensor):
         """
         Stage 1: Gating & Permutation
-        Purpose: Route tokens to experts and group them contiguously in memory
-        to maximize compute efficiency and prepare for All-to-All communication.
+        Returns:
+          permuted_data: [B*T*k, D] sorted by global expert id (thus also grouped by rank)
+          send_rank_counts: [world_size] tokens to send to each rank
+          send_expert_counts: [world_size, num_local_experts] counts per (rank, local_expert)
+          reverse_map_indices: [B*T*k] mapping back to original token rows (for unpermute)
+          sorted_weights: [B*T*k] gate weights aligned to permuted_data
+          (B, T): original shape
         """
-        # Unpack input shape: Batch, Seq Len, Hidden Dimension
-        # Example: [32, 2048, 8192]
         B, T, D = x.shape
-        # Flatten Batch and Seq Len to treat all tokens independently for routing.
-        # Shape: [B*T, D] -> [65,536, 8192]
-        x_flat = x.view(-1, D)
-        # 1. ROUTING
-        # Project tokens to expert space to get logits.
-        # Shape: [B*T, Num_Experts]
-        logits = self.router(x_flat)
-        # Select the top-k experts for each token.
-        # topk_weights: [B*T, k], topk_indices: [B*T, k]
-        topk_weights, topk_indices = torch.topk(logits, self.top_k, dim=-1)
-        # Normalize weights using Softmax over the top-k dimension.
-        # Shape: [B*T, k]
+        x_flat = x.view(-1, D)  # [N, D], N=B*T
+
+        # Router logits -> top-k
+        logits = self.router(x_flat)  # [N, E]
+        topk_weights, topk_indices = torch.topk(logits, self.top_k, dim=-1)  # [N,k]
         topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).type_as(x)
-        # 2. FLATTENING
-        # We unroll the 'k' dimension because physically, a token sent to 2 experts
-        # becomes 2 distinct computation tasks.
-        # Shape: [B*T*k] -> [131,072]
-        indices_flat = topk_indices.view(-1)
-        weights_flat = topk_weights.view(-1)
-        # 3. SORTING (CRITICAL)
-        # We perform an argsort on the expert indices. This gives us the permutation
-        # indices needed to group all tokens destined for Expert 0 together,
-        # then Expert 1, etc. This ensures contiguous memory access during compute.
-        # Shape: [B*T*k]
-        sort_indices = torch.argsort(indices_flat)
-        # Get the sorted expert IDs (0,0,0... 1,1,1... 2,2...).
-        # Used later for counting workload per expert.
-        # Shape: [B*T*k]
-        expert_indices_sorted = indices_flat[sort_indices]
-        # 4. PERMUTATION MAPPING
-        # Create source indices [0, 0, 1, 1, ..., N, N] (repeated k times).
-        # This tracks which original token row corresponds to the flattened routing decision.
-        # Shape: [B*T*k]
-        src_indices = torch.arange(x_flat.shape[0], device=x.device).repeat_interleave(self.top_k)
-        # Apply the sort permutation to the source indices.
-        # This tells us: "The 1st element in the sorted buffer comes from Token X in x_flat".
-        # Shape: [B*T*k]
-        reverse_map_indices = src_indices[sort_indices]
-        # Permute the weights to align with the sorted data.
-        # Shape: [B*T*k]
-        sorted_weights = weights_flat[sort_indices]
-        # 5. GATHER (SCATTER)
-        # Permute the actual token data. This physically moves data in VRAM.
-        # The result is a tensor where all inputs for Expert 0 are contiguous, etc.
-        # Shape: [B*T*k, D] -> [131,072, 8192] (Expansion factor of k)
-        permuted_data = x_flat[reverse_map_indices]
 
-        # 6. WORKLOAD ACCOUNTING
-        # Count how many tokens are assigned to each global expert.
-        # Shape: [Num_Experts]
-        global_expert_counts = torch.bincount(expert_indices_sorted, minlength=self.num_experts)
-        global_expert_counts = global_expert_counts.to(torch.int32)
+        # Flatten k dimension
+        indices_flat = topk_indices.reshape(-1)  # [N*k]
+        weights_flat = topk_weights.reshape(-1)  # [N*k]
 
-        # Experts are laid out contiguously per rank:
-        # rank = expert_id // num_local_experts
-        assert (
-            self.num_experts % self.world_size == 0
-        ), "num_experts must be divisible by world_size"
-        rank_ids = (expert_indices_sorted // self.num_local_experts).to(torch.int64)
-        rank_counts = torch.bincount(rank_ids, minlength=self.world_size).to(
-            torch.int32
-        )  # shape [world_size]
+        # Sanity: indices in range
+        assert indices_flat.numel() == x_flat.shape[0] * self.top_k
+        if torch._C._get_tracing_state() is None:  # avoid compile/tracing weirdness
+            assert int(indices_flat.min().item()) >= 0
+            assert int(indices_flat.max().item()) < self.num_experts
 
-        # Per-rank per-local-expert matrix (shape [world_size, num_local_experts])
-        expert_counts_by_rank = global_expert_counts.view(
+        # Sort by global expert id for contiguity
+        sort_indices = torch.argsort(indices_flat, stable=True)
+        expert_indices_sorted = indices_flat.index_select(0, sort_indices)  # [N*k]
+
+        # Reverse map: which original token row each expanded item came from
+        src_indices = torch.arange(
+            x_flat.shape[0], device=x.device, dtype=torch.int64
+        ).repeat_interleave(self.top_k)
+        reverse_map_indices = src_indices.index_select(0, sort_indices).to(torch.int64)  # [N*k]
+
+        sorted_weights = weights_flat.index_select(0, sort_indices).contiguous()
+        permuted_data = x_flat.index_select(0, reverse_map_indices).contiguous()  # [N*k, D]
+
+        # Counts per global expert (length = num_experts)
+        global_expert_counts = torch.bincount(
+            expert_indices_sorted.to(torch.int64), minlength=self.num_experts
+        ).to(torch.int32)
+
+        # Rank id for each sorted item: expert_id // num_local_experts
+        rank_ids = torch.div(
+            expert_indices_sorted.to(torch.int64), self.num_local_experts, rounding_mode="floor"
+        )  # [N*k] int64 in [0, world_size-1]
+
+        # send_rank_counts MUST be [world_size]
+        send_rank_counts = (
+            torch.bincount(rank_ids, minlength=self.world_size).to(torch.int32).contiguous()
+        )
+
+        # Per-rank per-local-expert counts: [world_size, num_local_experts]
+        send_expert_counts = global_expert_counts.view(
             self.world_size, self.num_local_experts
         ).contiguous()
 
-        # Sanity: make it fail fast if something goes wrong
-        assert rank_counts.numel() == self.world_size
-        assert expert_counts_by_rank.shape == (self.world_size, self.num_local_experts)
-
-        rank_counts = torch.tensor([permuted_data.shape[0]], device=x.device, dtype=torch.int32)
+        # Fail fast if anything is off
+        assert (
+            send_rank_counts.numel() == self.world_size
+        ), f"send_rank_counts wrong shape: {tuple(send_rank_counts.shape)}"
+        assert send_expert_counts.shape == (
+            self.world_size,
+            self.num_local_experts,
+        ), f"send_expert_counts wrong shape: {tuple(send_expert_counts.shape)}"
+        # Also check total accounting matches actual send items
+        assert (
+            int(send_rank_counts.sum().item()) == permuted_data.shape[0]
+        ), f"rank_counts sum {int(send_rank_counts.sum().item())} != permuted_data {permuted_data.shape[0]}"  # noqa
 
         return (
-            permuted_data,  # The sorted token data [B*T*k, D]
-            rank_counts,  # Load balancing for Data Exchange [WorldSize]
-            expert_counts_by_rank.to(
-                dtype=torch.long
-            ),  # Metadata for receiver to split buffer [WS, LocalExp]
-            reverse_map_indices,  # Indices to restore original order [B*T*k]
-            sorted_weights,  # Weights for the combine step [B*T*k]
-            (B, T),  # Original shape metadata
+            permuted_data,
+            send_rank_counts,  # FIXED: [world_size]
+            send_expert_counts.to(torch.long),
+            reverse_map_indices,  # [N*k]
+            sorted_weights,  # [N*k]
+            (B, T),
         )
 
     def dispatch_exchange(self, permuted_data, send_rank_counts, send_expert_counts):
-        # Metadata: enforce int32 + contiguous + 1D/2D expected shapes
+        # Metadata: enforce int32 + contiguous + expected shapes
         send_rank_counts = send_rank_counts.to(torch.int32).contiguous().view(-1)
         assert (
             send_rank_counts.numel() == self.world_size
@@ -194,16 +184,10 @@ class MoEFeedForward(nn.Module):
         recv_rank_counts = torch.empty_like(send_rank_counts)
         dist.all_to_all_single(recv_rank_counts, send_rank_counts, group=self.group)
 
-        # Build split lists on CPU (and assert lengths)
         send_list = send_rank_counts.cpu().to(torch.int64).tolist()
         recv_list = recv_rank_counts.cpu().to(torch.int64).tolist()
-
-        assert (
-            len(send_list) == self.world_size
-        ), f"len(send_list)={len(send_list)} ws={self.world_size}"
-        assert (
-            len(recv_list) == self.world_size
-        ), f"len(recv_list)={len(recv_list)} ws={self.world_size}"
+        assert len(send_list) == self.world_size
+        assert len(recv_list) == self.world_size
 
         total_recv = sum(recv_list)
         recv_data = torch.empty(
@@ -221,45 +205,26 @@ class MoEFeedForward(nn.Module):
         return recv_data, recv_list, send_list, tokens_per_local_expert
 
     def dispatch_exchange_static(self, permuted_data, static_splits, real_tokens_per_rank: int):
-        """Static Dispatch with Padding."""
         if self.world_size == 1:
             return permuted_data, static_splits, static_splits
-        # Calculate total size based on static splits (includes padding factor).
-        # This is a Python integer, so no GPU read is triggered.
+
         total_send = sum(static_splits)
 
-        # 1. PADDING LOGIC
-        # Check if we need to pad the data (Artificial Load Balancing / Benchmark Stress Test).
-        # permuted_data shape: [Actual_Tokens, Dim]
         if total_send > permuted_data.shape[0]:
-            # Allocate a larger buffer to hold real data + padding.
-            # Shape: [Total_Send_Static, Dim]
             send_data = torch.zeros(
                 total_send, self.dim, device=permuted_data.device, dtype=permuted_data.dtype
             )
-            # The static splits are uniform per rank.
             padded_per_rank = static_splits[0]
-            # View 1: The padded destination buffer [WS, Padded_Size, Dim]
             send_view = send_data.view(self.world_size, padded_per_rank, self.dim)
-            # View 2: The actual source data [WS, Real_Size, Dim]
-            # Assumes permuted_data is already sorted by rank (which gate_and_sort guarantees).
             src_view = permuted_data.view(self.world_size, real_tokens_per_rank, self.dim)
-            # Copy real data into the start of each rank's section.
-            # Result: [Real Data ..... | Padding .....] for each rank.
             send_view[:, :real_tokens_per_rank, :] = src_view
-            # Flatten back for NCCL.
             send_data = send_data.view(-1, self.dim)
         else:
             send_data = permuted_data
 
-        # Allocate receive buffer based on static knowledge.
-        # Shape: [Total_Recv_Static, Dim]
         recv_data = torch.empty(
             total_send, self.dim, device=permuted_data.device, dtype=permuted_data.dtype
         )
-        # 2. STATIC EXCHANGE
-        # This call is non-blocking on the CPU because static_splits is a Python list.
-        # The CPU launches the kernel and immediately moves to the next instruction.
         dist.all_to_all_single(
             recv_data,
             send_data,
@@ -268,16 +233,10 @@ class MoEFeedForward(nn.Module):
             group=self.group,
         )
 
-        # 3. DE-PADDING LOGIC
-        # If we padded the sent data, we must slice the received data to extract valid tokens.
         if total_send > permuted_data.shape[0]:
             padded_per_rank = static_splits[0]
-            # View receiving buffer by rank [WS, Padded_Size, Dim]
             recv_view = recv_data.view(self.world_size, padded_per_rank, self.dim)
-            # Slice out the real tokens. We know exactly how many real tokens to expect per rank.
-            # Shape: [WS, Real_Size, Dim] -> [Total_Real, Dim]
             real_recv = recv_view[:, :real_tokens_per_rank, :].reshape(-1, self.dim)
-            # Return contiguous buffer for optimal compute performance in the next stage.
             return real_recv.contiguous(), static_splits, static_splits
 
         return recv_data, static_splits, static_splits
@@ -309,29 +268,12 @@ class MoEFeedForward(nn.Module):
         return torch.cat(results, dim=0)
 
     def combine_exchange(self, expert_output, recv_splits, send_splits):
-        """
-        Stage 4: Dynamic Combine (Standard Implementation)
-        Purpose: Return processed tokens from experts back to their original ranks.
-        This is the reverse of the dispatch step.
-        """
         if self.world_size == 1:
             return expert_output
-        # Calculate the total size of the data we expect to receive back.
-        # 'send_splits' here refers to what we originally sent (which dictates what we get back).
-        # This summation happens on the CPU using the list we tracked earlier.
-        # Shape: Scalar (Total number of tokens this rank originally dispatched)
         total_back = sum(send_splits)
-        # Allocate the buffer for the final combined data.
-        # Shape: [Total_Original_Tokens, Hidden_Dim]
         final_data = torch.empty(
             total_back, self.dim, device=expert_output.device, dtype=expert_output.dtype
         )
-
-        # Execute the All-to-All communication.
-        # expert_output: The results from our local experts (to be sent back to others).
-        # final_data: The buffer to store results returning from other ranks.
-        # output_split_sizes=send_splits: We expect to receive as much as we originally sent to each rank. # noqa
-        # input_split_sizes=recv_splits: We are sending back exactly what we received (and computed on). # noqa
         dist.all_to_all_single(
             final_data,
             expert_output,
@@ -342,43 +284,21 @@ class MoEFeedForward(nn.Module):
         return final_data
 
     def combine_exchange_static(self, expert_output, static_splits, real_tokens_per_rank: int):
-        """
-        Stage 4: Static Combine (Pipelined Benchmark)
-        Purpose: Non-blocking, padded return of tokens to support overlap.
-        Mirror image of dispatch_exchange_static.
-        """
         if self.world_size == 1:
             return expert_output
-        # Total size to send/receive (including padding factor).
-        # Calculated from static_splits (Python list), so no CPU block.
+
         total_send = sum(static_splits)
-        # 1. PADDING LOGIC (OUTPUT SIDE)
-        # If we are simulating higher bandwidth usage (dead weight), we pad the output.
         if total_send > expert_output.shape[0]:
-            # Allocate padded send buffer.
-            # Shape: [Total_Send_Static, Dim]
             send_data = torch.zeros(
                 total_send, self.dim, device=expert_output.device, dtype=expert_output.dtype
             )
-            # SIMPLIFICATION FOR BENCHMARK:
-            # Unlike dispatch, we don't strictly need to interleave padding for correctness
-            # because 'expert_output' is already a contiguous block of results.
-            # We simply copy the valid results to the start of the buffer.
-            # Rank 0 will receive valid data + garbage. Other ranks might receive mostly garbage.
-            # This is fine because we discard the garbage immediately after receipt.
-            # Validity: The timing and bandwidth stress are identical to a rigorous padding.
             send_data[: expert_output.shape[0]] = expert_output
         else:
             send_data = expert_output
 
-        # Allocate the receiving buffer (padded size).
-        # Shape: [Total_Recv_Static, Dim]
         final_data_padded = torch.empty(
             total_send, self.dim, device=expert_output.device, dtype=expert_output.dtype
         )
-        # 2. STATIC EXCHANGE
-        # Non-blocking call. CPU queues this and moves on.
-        # Symmetric exchange: We send and receive 'total_send' tokens.
         dist.all_to_all_single(
             final_data_padded,
             send_data,
@@ -386,12 +306,8 @@ class MoEFeedForward(nn.Module):
             input_split_sizes=static_splits,
             group=self.group,
         )
-        # 3. DE-PADDING LOGIC
-        # If we used padding, we must slice the result to return only the real data.
-        # We expect 'expert_output.shape[0]' tokens back (the same amount we started with).
+
         if total_send > expert_output.shape[0]:
-            # Slice the valid data from the start of the buffer.
-            # Shape: [Real_Token_Count, Dim]
             return final_data_padded[: expert_output.shape[0]]
 
         return final_data_padded
@@ -412,9 +328,7 @@ class MoEFeedForward(nn.Module):
         raise NotImplementedError
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Standard Implementation
         permuted, send_rank_counts, send_exp_counts, rev_idx, weights, shape = self.gate_and_sort(x)
-        # Dynamic path: Pass tensors directly, handle blocking inside dispatch_exchange
         recv_data, recv_splits, send_splits_list, tokens_per_expert = self.dispatch_exchange(
             permuted, send_rank_counts, send_exp_counts
         )
