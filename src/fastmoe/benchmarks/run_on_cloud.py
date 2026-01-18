@@ -116,6 +116,8 @@ def run_training_experiment(implementation: str, cfg: MoESetup):
         n_layers=2,
         num_experts=cfg.num_experts,
         implementation=implementation,
+        comm_balance_factor=cfg.comm_balance_factor,
+        use_moe=True,
     ).to(device)
 
     optimizer = optim.SGD(model.parameters(), lr=0.5)
