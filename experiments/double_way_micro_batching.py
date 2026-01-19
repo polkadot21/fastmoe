@@ -49,15 +49,35 @@ def is_rank0():
 ###
 
 
-def all_to_all_single_async(
-    input_tensor: torch.Tensor,
-    in_splits,
-    out_splits,
-    group=None,
-):
+import inspect  # noqa
+
+
+def _all_to_all_single_async(out, inp, *, group, in_splits, out_splits):
+    """
+    Compatibility shim for different PyTorch arg names:
+      - some versions use input_split_sizes/output_split_sizes
+      - others use in_split_sizes/out_split_sizes
+    """
+    sig = inspect.signature(dist.all_to_all_single)
+    params = sig.parameters
+
+    kwargs = {"group": group, "async_op": True}
+
+    if "input_split_sizes" in params and "output_split_sizes" in params:
+        kwargs["input_split_sizes"] = in_splits
+        kwargs["output_split_sizes"] = out_splits
+    else:
+        # Older/alternate naming
+        kwargs["in_split_sizes"] = in_splits
+        kwargs["out_split_sizes"] = out_splits
+
+    return dist.all_to_all_single(out, inp, **kwargs)
+
+
+def all_to_all_single_async(input_tensor: torch.Tensor, in_splits, out_splits, group=None):
     """
     Variable-split all_to_all_single with async_op=True.
-    Returns output tensor. The NCCL Work handle is attached as output._work.
+    Returns output tensor. Work handle attached as output._work.
     """
     assert input_tensor.is_cuda
     out0 = torch.empty(
@@ -65,15 +85,9 @@ def all_to_all_single_async(
         device=input_tensor.device,
         dtype=input_tensor.dtype,
     )
-    work = dist.all_to_all_single(
-        out0,
-        input_tensor,
-        out_split_sizes=out_splits,
-        in_split_sizes=in_splits,
-        group=group,
-        async_op=True,
+    work = _all_to_all_single_async(
+        out0, input_tensor, group=group, in_splits=in_splits, out_splits=out_splits
     )
-    # Keep it alive.
     out0._work = work
     return out0
 
@@ -86,13 +100,8 @@ def exchange_counts_async(send_counts_i32: torch.Tensor, group=None):
     ws = send_counts_i32.numel()
     recv = torch.empty_like(send_counts_i32)
     ones = [1] * ws
-    work = dist.all_to_all_single(
-        recv,
-        send_counts_i32,
-        out_split_sizes=ones,
-        in_split_sizes=ones,
-        group=group,
-        async_op=True,
+    work = _all_to_all_single_async(
+        recv, send_counts_i32, group=group, in_splits=ones, out_splits=ones
     )
     recv._work = work
     return recv
