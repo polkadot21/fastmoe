@@ -501,4 +501,11 @@ def _worker(rank, world_size):
     run_profiled_demo(steps=10, batch=4, seqlen=256, layers=2, local_experts=2)
 
 
-mp.spawn(_worker, args=(2,), nprocs=2, join=True)
+# IMPORTANT: fork avoids pickling notebook __main__
+mp.start_processes(
+    _worker,
+    args=(2,),
+    nprocs=2,
+    start_method="fork",
+    join=True,
+)
