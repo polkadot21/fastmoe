@@ -7,11 +7,11 @@ import torch.nn as nn
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 # ==========================================
-# Configuration (Matches Lancet Fig 4c)
+# Configuration (Matches Lancet Fig 4d: Full Overlap)
 # ==========================================
-BATCH_SIZE = 64  # Small batch for 2 MBs (32 per MB)
-MICRO_BATCHES = 2  # Strictly 2 micro-batches
-HIDDEN_DIM = 4096  # Large enough to make compute visible
+BATCH_SIZE = 128
+MICRO_BATCHES = 2  # Using 4 to clearly see the 5-stage pipeline depth
+HIDDEN_DIM = 4096
 NUM_EXPERTS_PER_GPU = 2
 TOP_K = 2
 WARMUP_STEPS = 5
@@ -21,7 +21,6 @@ ACTIVE_STEPS = 5
 class Expert(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        # Heavy MLP to make compute visible in profiling vs communication
         self.fc1 = nn.Linear(dim, dim * 4)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(dim * 4, dim)
@@ -30,7 +29,7 @@ class Expert(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
-class LancetBlock(nn.Module):
+class LancetBlockFull(nn.Module):
     def __init__(self, hidden_dim, num_experts, world_size, group):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -38,22 +37,20 @@ class LancetBlock(nn.Module):
         self.world_size = world_size
         self.group = group
 
-        # 1. Monolithic Ops (Before Pipeline) - e.g. SelfAttn^L
+        # 1. Pre-Ops (Current Layer Attention + Gate)
+        # In Fig 4d, these are ALSO micro-batched
         self.attn_norm = nn.LayerNorm(hidden_dim)
         self.attn = nn.Linear(hidden_dim, hidden_dim)
-
-        # 2. Gate (Monolithic) - Gate^L
         self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
 
-        # 3. Experts
+        # 2. Experts
         self.experts = nn.ModuleList([Expert(hidden_dim) for _ in range(self.num_local_experts)])
 
-        # 4. Next Ops (The "Extend Forward" part) - e.g. SA^{L+1}
-        # These will be micro-batched and overlapped with Combine A2A
+        # 3. Post-Ops (Next Layer Attention)
         self.next_layer_ops = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU())
 
         # Streams
-        self.stream_compute = torch.cuda.Stream()  # Runs NextOps (SA^{L+1})
+        self.stream_compute = torch.cuda.Stream()  # Runs Pre-Ops AND Post-Ops
         self.stream_comm = torch.cuda.Stream()  # Runs A2A Dispatch/Combine
         self.stream_expert = torch.cuda.Stream()  # Runs Experts
 
@@ -61,70 +58,70 @@ class LancetBlock(nn.Module):
         B, S, D = x.shape
         x_flat = x.view(B * S, D)
 
-        # --- Phase 1: Monolithic Pre-Computation ---
-        with record_function("Monolithic_PreOps"):
-            # Self Attention (Simulated)
-            x_attn = self.attn(self.attn_norm(x_flat)) + x_flat
+        # Split Raw Input for Pre-Ops Micro-batching (Fig 4d)
+        chunks = x_flat.chunk(MICRO_BATCHES)
 
-            # Gating
-            logits = self.gate(x_attn)
-            _, indices = torch.topk(logits, k=TOP_K, dim=1)
-
-            # Permutation (Simulated cost)
-            gated_input = x_attn.clone()
-
-        # --- Phase 2: Lancet Pipeline (2 Micro-batches) ---
-        chunks = gated_input.chunk(MICRO_BATCHES)
-
-        # Pipeline State
         pipeline_buffers = [{} for _ in range(MICRO_BATCHES)]
         outputs = [None] * MICRO_BATCHES
 
-        # Synchronization Events
+        # Events for dependency management
+        ev_pre_ready = [torch.cuda.Event() for _ in range(MICRO_BATCHES)]
         ev_dispatch_ready = [torch.cuda.Event() for _ in range(MICRO_BATCHES)]
         ev_expert_ready = [torch.cuda.Event() for _ in range(MICRO_BATCHES)]
         ev_combine_ready = [torch.cuda.Event() for _ in range(MICRO_BATCHES)]
 
-        # Tick 0: Dispatch_0
-        # Tick 1: Dispatch_1 | Expert_0
-        # Tick 2: Combine_0  | Expert_1
-        # Tick 3: Combine_1  | NextOps_0 (Overlap!)
-        # Tick 4: NextOps_1
+        # ----------------------------------------------------------------
+        # 5-Stage Pipeline Loop (Pre -> Disp -> Exp -> Comb -> Post)
+        # ----------------------------------------------------------------
+        # We iterate enough ticks to flush the pipeline.
+        # Tick offsets:
+        # PreOps:   tick
+        # Dispatch: tick - 1
+        # Expert:   tick - 2
+        # Combine:  tick - 3
+        # PostOps:  tick - 4
 
-        for tick in range(MICRO_BATCHES + 3):
-            # Stage 4: Next Ops (Compute Stream)
-            mb_next = tick - 3
-            if 0 <= mb_next < MICRO_BATCHES:
-                buf = pipeline_buffers[mb_next]
-                self.stream_compute.wait_event(ev_combine_ready[mb_next])
+        total_ticks = MICRO_BATCHES + 4
+
+        for tick in range(total_ticks):
+            # --- Stage 5: Post-Ops (Compute Stream) ---
+            mb_post = tick - 4
+            if 0 <= mb_post < MICRO_BATCHES:
+                buf = pipeline_buffers[mb_post]
+                self.stream_compute.wait_event(ev_combine_ready[mb_post])
 
                 with torch.cuda.stream(self.stream_compute):
-                    with record_function(f"NextOps_MB{mb_next}"):
+                    torch.cuda.nvtx.range_push(f"PostOps_MB{mb_post}")
+                    with record_function(f"PostOps_MB{mb_post}"):
                         out = self.next_layer_ops(buf["combined_output"])
-                        outputs[mb_next] = out
+                        outputs[mb_post] = out
+                    torch.cuda.nvtx.range_pop()
 
-            # Stage 3: Combine All-to-All (Comm Stream)
-            mb_comb = tick - 2
+            # --- Stage 4: Combine A2A (Comm Stream) ---
+            mb_comb = tick - 3
             if 0 <= mb_comb < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_comb]
                 self.stream_comm.wait_event(ev_expert_ready[mb_comb])
 
                 with torch.cuda.stream(self.stream_comm):
+                    torch.cuda.nvtx.range_push(f"A2A_Combine_MB{mb_comb}")
                     with record_function(f"A2A_Combine_MB{mb_comb}"):
                         combined = torch.empty_like(buf["dispatch_input"])
                         dist.all_to_all_single(
                             combined, buf["expert_output"], group=self.group, async_op=False
                         )
                         buf["combined_output"] = combined
+                    torch.cuda.nvtx.range_pop()
                 ev_combine_ready[mb_comb].record(self.stream_comm)
 
-            # Stage 2: Expert Compute (Expert Stream)
-            mb_exp = tick - 1
+            # --- Stage 3: Expert Compute (Expert Stream) ---
+            mb_exp = tick - 2
             if 0 <= mb_exp < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_exp]
                 self.stream_expert.wait_event(ev_dispatch_ready[mb_exp])
 
                 with torch.cuda.stream(self.stream_expert):
+                    torch.cuda.nvtx.range_push(f"Expert_MB{mb_exp}")
                     with record_function(f"Expert_MB{mb_exp}"):
                         inp = buf["dispatch_output"]
                         local_splits = inp.chunk(self.num_local_experts)
@@ -132,22 +129,48 @@ class LancetBlock(nn.Module):
                             self.experts[i](local_splits[i]) for i in range(self.num_local_experts)
                         ]
                         buf["expert_output"] = torch.cat(res)
+                    torch.cuda.nvtx.range_pop()
                 ev_expert_ready[mb_exp].record(self.stream_expert)
 
-            # Stage 1: Dispatch All-to-All (Comm Stream)
-            mb_disp = tick
+            # --- Stage 2: Dispatch A2A (Comm Stream) ---
+            mb_disp = tick - 1
             if 0 <= mb_disp < MICRO_BATCHES:
-                if mb_disp == 0:
-                    self.stream_comm.wait_stream(torch.cuda.current_stream())
+                buf = pipeline_buffers[mb_disp]
+                self.stream_comm.wait_event(ev_pre_ready[mb_disp])
 
                 with torch.cuda.stream(self.stream_comm):
+                    torch.cuda.nvtx.range_push(f"A2A_Dispatch_MB{mb_disp}")
                     with record_function(f"A2A_Dispatch_MB{mb_disp}"):
-                        inp = chunks[mb_disp]
-                        pipeline_buffers[mb_disp]["dispatch_input"] = inp
+                        inp = buf["gated_input"]
+                        pipeline_buffers[mb_disp]["dispatch_input"] = inp  # Save for shape ref
                         out = torch.empty_like(inp)
                         dist.all_to_all_single(out, inp, group=self.group, async_op=False)
                         pipeline_buffers[mb_disp]["dispatch_output"] = out
+                    torch.cuda.nvtx.range_pop()
                 ev_dispatch_ready[mb_disp].record(self.stream_comm)
+
+            # --- Stage 1: Pre-Ops (Compute Stream) - Fig 4d Split ---
+            mb_pre = tick
+            if 0 <= mb_pre < MICRO_BATCHES:
+                # Pre-ops run on Compute stream.
+                # Note: Post-ops ALSO run on Compute stream (Stage 5).
+                # Since 'tick' loop is serial on CPU, Stage 5 (Post) was launched first
+                # into the Compute stream above. Stage 1 (Pre) is queued AFTER it.
+                # This naturally serializes Pre/Post ops on the same stream, which is fine/desired.
+
+                with torch.cuda.stream(self.stream_compute):
+                    torch.cuda.nvtx.range_push(f"PreOps_MB{mb_pre}")
+                    with record_function(f"PreOps_MB{mb_pre}"):
+                        x_chunk = chunks[mb_pre]
+                        # Attention + Gate
+                        x_attn = self.attn(self.attn_norm(x_chunk)) + x_chunk
+                        logits = self.gate(x_attn)
+                        _, indices = torch.topk(logits, k=TOP_K, dim=1)
+                        # Simulate Permutation
+                        gated = x_attn.clone()
+                        pipeline_buffers[mb_pre]["gated_input"] = gated
+                    torch.cuda.nvtx.range_pop()
+                ev_pre_ready[mb_pre].record(self.stream_compute)
 
         # Final Sync
         torch.cuda.current_stream().wait_stream(self.stream_compute)
@@ -156,55 +179,45 @@ class LancetBlock(nn.Module):
 
 
 def worker(rank, world_size):
+    # Unique port to avoid conflicts if re-running
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12356"
+    os.environ["MASTER_PORT"] = "12357"
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    # Model Setup
-    model = LancetBlock(
+    # Setup
+    model = LancetBlockFull(
         HIDDEN_DIM, NUM_EXPERTS_PER_GPU * world_size, world_size, dist.group.WORLD
     ).cuda()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     data = torch.randn(BATCH_SIZE, 128, HIDDEN_DIM).cuda()
 
     # ------------------------------------------------------------
-    # Profiler Handler (Rank 0 only)
+    # Trace Handler (Strictly Rank 0)
     # ------------------------------------------------------------
     def trace_handler(p):
         if rank == 0:
-            # Add metadata to the trace
-            p.add_metadata("World Size", str(world_size))
-            p.add_metadata("Batch Size", str(BATCH_SIZE))
-            p.add_metadata("Micro Batches", str(MICRO_BATCHES))
-            p.add_metadata("Hidden Dim", str(HIDDEN_DIM))
-
-            output_file = "lancet_overlap_rank0.json"
-            p.export_chrome_trace(output_file)
-            print("\n[Rank 0] Profiling Complete.")
-            print(f"[Rank 0] Trace saved to: {output_file}")
-            print(f"[Rank 0] Metadata: GPUs={world_size}, Batch={BATCH_SIZE}, MB={MICRO_BATCHES}")
-
-    if rank == 0:
-        print(f"[Rank 0] Starting Warmup ({WARMUP_STEPS} steps)...")
+            p.add_metadata("Config", f"MB={MICRO_BATCHES}, GPUs={world_size}")
+            # Export trace
+            p.export_chrome_trace("lancet_full_fig4d_rank0.json")
+            print("[Rank 0] Trace saved: lancet_full_fig4d_rank0.json")
 
     # Warmup
+    if rank == 0:
+        print("[Rank 0] Warming up...")
     for _ in range(WARMUP_STEPS):
         loss = model(data).sum()
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
 
+    # Profile
     if rank == 0:
-        print(f"[Rank 0] Starting Active Profiling ({ACTIVE_STEPS} steps)...")
-
-    # ------------------------------------------------------------
-    # Profiling Loop
-    # Added ProfilerActivity.CPU to capture 'record_function' labels
-    # ------------------------------------------------------------
+        print("[Rank 0] Profiling...")
+    # Included CPU activity to capture the labels
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        schedule=schedule(wait=0, warmup=0, active=ACTIVE_STEPS, repeat=1),
+        schedule=schedule(wait=0, warmup=0, active=ACTIVE_STEPS),
         on_trace_ready=trace_handler,
         record_shapes=True,
         with_stack=True,
@@ -219,11 +232,12 @@ def worker(rank, world_size):
     dist.destroy_process_group()
 
 
-n_gpus = torch.cuda.device_count()
-world_size = 8
+if __name__ == "__main__":
+    n_gpus = torch.cuda.device_count()
+    world_size = 2
 
-if n_gpus < world_size:
-    print(f"Error: Script requires at least {world_size} GPUs, but found {n_gpus}.")
-else:
-    print(f"Launching Lancet Demo on {world_size} GPUs...")
-    mp.spawn(worker, args=(world_size,), nprocs=world_size, join=True)
+    if n_gpus < world_size:
+        print(f"Error: Need {world_size} GPUs, found {n_gpus}")
+    else:
+        print(f"Launching Lancet Full Pipeline (Fig 4d) on {world_size} GPUs")
+        mp.spawn(worker, args=(world_size,), nprocs=world_size, join=True)
