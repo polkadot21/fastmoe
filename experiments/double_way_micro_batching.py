@@ -50,6 +50,10 @@ def r0log(msg: str):
         print(msg, flush=True)
 
 
+def sync():
+    torch.cuda.synchronize()
+
+
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 ###
@@ -439,15 +443,13 @@ def run_profiled_demo(
     d_hidden=2048,
     layers=2,
     local_experts=2,
+    out_dir="./traces",
+    warmup_iters=3,
 ):
     rank, world, local_rank = ddp_init()
+    os.makedirs(out_dir, exist_ok=True)
+
     device = torch.device("cuda", local_rank)
-
-    r0log(f"[init] rank={rank}/{world} local_rank={local_rank} device={device}")
-    r0log(
-        f"[cfg] steps={steps} batch={batch} seqlen={seqlen} layers={layers} local_experts={local_experts}"  # noqa
-    )
-
     model = TinyModel(
         vocab=vocab,
         d_model=d_model,
@@ -459,33 +461,45 @@ def run_profiled_demo(
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
+    # Build TWO batches: tiny warmup batch + real batch
     torch.manual_seed(1234 + rank)
+
+    warm_tokens = torch.randint(0, vocab, (max(1, batch // 4), max(16, seqlen // 8)), device=device)
+    warm_targets = torch.randint(0, vocab, warm_tokens.shape, device=device)
+
     tokens = torch.randint(0, vocab, (batch, seqlen), device=device)
     targets = torch.randint(0, vocab, (batch, seqlen), device=device)
 
-    # Make sure everyone is ready before starting
-    torch.cuda.synchronize(device)
+    # ---- Warmup: no profiler ----
     barrier()
-    r0log("[run] starting loop")
+    r0log(f"[warmup] starting {warmup_iters} iters | warm shape={tuple(warm_tokens.shape)}")
+    for i in range(warmup_iters):
+        t0 = time.perf_counter()
+        opt.zero_grad(set_to_none=True)
+        logits = model(warm_tokens)
+        loss = F.cross_entropy(logits.reshape(-1, vocab), warm_targets.reshape(-1))
+        loss.backward()
+        opt.step()
+        sync()
+        dt = (time.perf_counter() - t0) * 1000
+        r0log(f"[warmup] iter {i+1}/{warmup_iters} loss={loss.item():.4f} time={dt:.1f} ms")
 
+    barrier()
+    r0log("[warmup] done. starting profiled run...")
+
+    # ---- Profiled run ----
     prof = profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        schedule=schedule(wait=2, warmup=2, active=4, repeat=1),
+        schedule=schedule(wait=1, warmup=1, active=4, repeat=1),
         record_shapes=True,
         profile_memory=True,
         with_stack=False,
     )
 
     prof.start()
-
-    # Simple timing (GPU-synced each step so times are real)
     for step in range(steps):
-        step_t0 = time.perf_counter()
-
+        t0 = time.perf_counter()
         opt.zero_grad(set_to_none=True)
-
-        if step == 0:
-            r0log("[stage] first forward (may be slow due to CUDA/NCCL warmup)")
 
         with record_function("forward"):
             logits = model(tokens)
@@ -498,23 +512,16 @@ def run_profiled_demo(
             opt.step()
 
         prof.step()
+        sync()
 
-        # Synchronize so timing/log reflects completed work
-        torch.cuda.synchronize(device)
-
-        step_ms = (time.perf_counter() - step_t0) * 1000.0
-
-        # Rank-0 logs only (every step; change to step % N == 0 if too chatty)
-        r0log(
-            f"[rank0] step {step + 1:03d}/{steps}  loss={float(loss.item()):.4f}  step_time={step_ms:.1f} ms"  # noqa
-        )
+        dt = (time.perf_counter() - t0) * 1000
+        r0log(f"[train] step {step+1}/{steps} loss={loss.item():.4f} time={dt:.1f} ms")
 
     prof.stop()
 
-    # Export trace — also log when it happens
-    trace_path = f"./traces/rank{rank}_trace.json"
+    trace_path = os.path.join(out_dir, f"rank{rank}_trace.json")
     if rank == 0:
-        r0log(f"[trace] exporting to {trace_path}")
+        r0log(f"[trace] exporting {trace_path}")
     prof.export_chrome_trace(trace_path)
     if rank == 0:
         r0log("[trace] export done")
