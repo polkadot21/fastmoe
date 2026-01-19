@@ -18,6 +18,10 @@ TOP_K = 2
 WARMUP_STEPS = 5
 ACTIVE_STEPS = 3
 
+# --- Dead Weight Config ---
+# We bloat communication by 5x to match the 45ms Expert Compute
+COMM_SCALING_FACTOR = 5
+
 
 # ==========================================
 # Model Definition
@@ -78,6 +82,7 @@ class LancetBlockFull(nn.Module):
             if 0 <= mb_post < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_post]
                 self.stream_compute.wait_event(ev_combine_ready[mb_post])
+
                 with torch.cuda.stream(self.stream_compute):
                     torch.cuda.nvtx.range_push(f"PostOps_MB{mb_post}")
                     with record_function(f"PostOps_MB{mb_post}"):
@@ -90,14 +95,30 @@ class LancetBlockFull(nn.Module):
             if 0 <= mb_comb < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_comb]
                 self.stream_comm.wait_event(ev_expert_ready[mb_comb])
+
                 with torch.cuda.stream(self.stream_comm):
+                    # NVTX Annotations for the Timeline
                     torch.cuda.nvtx.range_push(f"A2A_Combine_MB{mb_comb}")
                     with record_function(f"A2A_Combine_MB{mb_comb}"):
-                        combined = torch.empty_like(buf["dispatch_input"])
+                        # --- Dead Weight Injection ---
+                        # We inflate the tensor size to slow down communication
+                        # Real input: buf['expert_output']
+                        real_input = buf["expert_output"]
+
+                        # Create bloated tensor (Repeat data on last dim)
+                        bloated_input = real_input.repeat(1, COMM_SCALING_FACTOR)
+                        bloated_output = torch.empty_like(bloated_input)
+
+                        # Perform the Slow A2A
                         dist.all_to_all_single(
-                            combined, buf["expert_output"], group=self.group, async_op=False
+                            bloated_output, bloated_input, group=self.group, async_op=False
                         )
-                        buf["combined_output"] = combined
+
+                        # Discard padded data, keep original size for next steps
+                        # (In a real run we'd split bloated_output, but this is for profiling visuals) # noqa
+                        # We just reconstruct the 'expected' shape to keep pipeline valid
+                        buf["combined_output"] = torch.empty_like(real_input)
+
                     torch.cuda.nvtx.range_pop()
                 ev_combine_ready[mb_comb].record(self.stream_comm)
 
@@ -106,6 +127,7 @@ class LancetBlockFull(nn.Module):
             if 0 <= mb_exp < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_exp]
                 self.stream_expert.wait_event(ev_dispatch_ready[mb_exp])
+
                 with torch.cuda.stream(self.stream_expert):
                     torch.cuda.nvtx.range_push(f"Expert_MB{mb_exp}")
                     with record_function(f"Expert_MB{mb_exp}"):
@@ -123,14 +145,25 @@ class LancetBlockFull(nn.Module):
             if 0 <= mb_disp < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_disp]
                 self.stream_comm.wait_event(ev_pre_ready[mb_disp])
+
                 with torch.cuda.stream(self.stream_comm):
                     torch.cuda.nvtx.range_push(f"A2A_Dispatch_MB{mb_disp}")
                     with record_function(f"A2A_Dispatch_MB{mb_disp}"):
-                        inp = buf["gated_input"]
-                        pipeline_buffers[mb_disp]["dispatch_input"] = inp
-                        out = torch.empty_like(inp)
-                        dist.all_to_all_single(out, inp, group=self.group, async_op=False)
-                        pipeline_buffers[mb_disp]["dispatch_output"] = out
+                        real_input = buf["gated_input"]
+                        pipeline_buffers[mb_disp]["dispatch_input"] = real_input
+
+                        # --- Dead Weight Injection ---
+                        bloated_input = real_input.repeat(1, COMM_SCALING_FACTOR)
+                        bloated_output = torch.empty_like(bloated_input)
+
+                        # Slow A2A
+                        dist.all_to_all_single(
+                            bloated_output, bloated_input, group=self.group, async_op=False
+                        )
+
+                        # Restore logical shape for pipeline continuity
+                        pipeline_buffers[mb_disp]["dispatch_output"] = torch.empty_like(real_input)
+
                     torch.cuda.nvtx.range_pop()
                 ev_dispatch_ready[mb_disp].record(self.stream_comm)
 
@@ -158,25 +191,24 @@ class LancetBlockFull(nn.Module):
 # Worker Function
 # ==========================================
 def worker(rank, world_size):
-    # Set up distributed environment
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12359"  # New port
+    os.environ["MASTER_PORT"] = "12360"  # New port
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    # Initialize Model
     model = LancetBlockFull(
         HIDDEN_DIM, NUM_EXPERTS_PER_GPU * world_size, world_size, dist.group.WORLD
     ).cuda()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     data = torch.randn(BATCH_SIZE, 128, HIDDEN_DIM).cuda()
 
-    # Trace Handler
     def trace_handler(p):
         dist.barrier()
         if rank == 0:
-            p.add_metadata("Config", f"MB={MICRO_BATCHES}, GPUs={world_size}")
-            abs_path = os.path.abspath("lancet_notebook_trace_rank0.json")
+            p.add_metadata(
+                "Config", f"MB={MICRO_BATCHES}, GPUs={world_size}, CommScale={COMM_SCALING_FACTOR}"
+            )
+            abs_path = os.path.abspath("lancet_balanced_overlap.json")
             p.export_chrome_trace(abs_path)
             print(f"\n[Rank 0] Trace saved to: {abs_path}")
 
@@ -189,9 +221,8 @@ def worker(rank, world_size):
         optimizer.step()
         optimizer.zero_grad()
 
-    # Profiling
     if rank == 0:
-        print("[Rank 0] Profiling...")
+        print(f"[Rank 0] Profiling with {COMM_SCALING_FACTOR}x Communication Bloat...")
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=schedule(wait=1, warmup=1, active=ACTIVE_STEPS, repeat=1),
@@ -207,30 +238,20 @@ def worker(rank, world_size):
             optimizer.zero_grad()
             p.step()
 
-    # Cleanup
-    if rank == 0:
-        print("[Rank 0] Flushing traces...")
     time.sleep(2)
     dist.barrier()
     dist.destroy_process_group()
 
 
 # ==========================================
-# Execution (Notebook Cell Friendly)
+# Execution
 # ==========================================
 def run_experiment():
-    # Hardcoded to 2 for safety in notebook execution; set to 8 if you have 8 GPUs
     world_size = 2
-
-    print(f"Starting processes with method='fork' for {world_size} GPUs...")
-
-    # Use mp.start_processes with 'fork'
-    # NOTE: This works in a notebook cell because 'fork' copies the memory,
-    # so 'worker' function is visible to children without being importable.
+    print(f"Starting processes for {world_size} GPUs...")
     mp.start_processes(
         worker, args=(world_size,), nprocs=world_size, join=True, start_method="fork"
     )
 
 
-# Run it directly
 run_experiment()
