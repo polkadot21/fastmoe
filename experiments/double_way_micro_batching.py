@@ -3,6 +3,7 @@
 ###
 
 import os
+import time
 from dataclasses import dataclass
 
 import torch
@@ -43,6 +44,13 @@ def barrier():
 def is_rank0():
     return (not dist.is_initialized()) or dist.get_rank() == 0
 
+
+def r0log(msg: str):
+    if (not dist.is_initialized()) or dist.get_rank() == 0:
+        print(msg, flush=True)
+
+
+os.environ["PYTHONUNBUFFERED"] = "1"
 
 ###
 # Cell 2 — Async all-to-all wrapper (keeps Work handle alive)
@@ -431,12 +439,15 @@ def run_profiled_demo(
     d_hidden=2048,
     layers=2,
     local_experts=2,
-    out_dir="./traces",
 ):
     rank, world, local_rank = ddp_init()
-    os.makedirs(out_dir, exist_ok=True)
-
     device = torch.device("cuda", local_rank)
+
+    r0log(f"[init] rank={rank}/{world} local_rank={local_rank} device={device}")
+    r0log(
+        f"[cfg] steps={steps} batch={batch} seqlen={seqlen} layers={layers} local_experts={local_experts}"  # noqa
+    )
+
     model = TinyModel(
         vocab=vocab,
         d_model=d_model,
@@ -446,13 +457,16 @@ def run_profiled_demo(
         local_experts=local_experts,
     ).to(device)
 
-    # Simple optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-    # Fake language modeling batch
     torch.manual_seed(1234 + rank)
     tokens = torch.randint(0, vocab, (batch, seqlen), device=device)
     targets = torch.randint(0, vocab, (batch, seqlen), device=device)
+
+    # Make sure everyone is ready before starting
+    torch.cuda.synchronize(device)
+    barrier()
+    r0log("[run] starting loop")
 
     prof = profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -463,11 +477,18 @@ def run_profiled_demo(
     )
 
     prof.start()
-    for _ in range(steps):
+
+    # Simple timing (GPU-synced each step so times are real)
+    for step in range(steps):
+        step_t0 = time.perf_counter()
+
         opt.zero_grad(set_to_none=True)
 
+        if step == 0:
+            r0log("[stage] first forward (may be slow due to CUDA/NCCL warmup)")
+
         with record_function("forward"):
-            logits = model(tokens)  # [B,S,V]
+            logits = model(tokens)
             loss = F.cross_entropy(logits.reshape(-1, vocab), targets.reshape(-1))
 
         with record_function("backward"):
@@ -476,23 +497,32 @@ def run_profiled_demo(
         with record_function("opt_step"):
             opt.step()
 
-        # Step the profiler
         prof.step()
 
-        # A light sync makes step boundaries clearer in trace
+        # Synchronize so timing/log reflects completed work
         torch.cuda.synchronize(device)
+
+        step_ms = (time.perf_counter() - step_t0) * 1000.0
+
+        # Rank-0 logs only (every step; change to step % N == 0 if too chatty)
+        r0log(
+            f"[rank0] step {step + 1:03d}/{steps}  loss={float(loss.item()):.4f}  step_time={step_ms:.1f} ms"  # noqa
+        )
 
     prof.stop()
 
-    # Export chrome trace for Perfetto
-    trace_path = os.path.join(out_dir, f"rank{rank}_trace.json")
+    # Export trace — also log when it happens
+    trace_path = f"./traces/rank{rank}_trace.json"
+    if rank == 0:
+        r0log(f"[trace] exporting to {trace_path}")
     prof.export_chrome_trace(trace_path)
-
-    if is_rank0():
-        print(f"Saved traces to: {out_dir}")
-        print(f"Open in Perfetto: load {trace_path} (and other rank traces if desired).")
+    if rank == 0:
+        r0log("[trace] export done")
 
     barrier()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
     return trace_path
 
 
