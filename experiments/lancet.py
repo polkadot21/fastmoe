@@ -12,7 +12,7 @@ from torch.profiler import ProfilerActivity, profile, record_function, schedule
 # Configuration
 # ==========================================
 BATCH_SIZE = 128
-MICRO_BATCHES = 4
+MICRO_BATCHES = 2
 HIDDEN_DIM = 4096
 NUM_HEADS = 32
 NUM_EXPERTS_PER_GPU = 2
@@ -47,7 +47,7 @@ class RealSelfAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
         out = self.o_proj(out)
-        return out + residual  # Residual 1 is handled here
+        return out + residual  # Residual 1
 
 
 class Expert(nn.Module):
@@ -62,11 +62,19 @@ class Expert(nn.Module):
 
 
 # ==========================================
-# Configurable Lancet Block
+# Configurable Lancet Block (Shared Streams)
 # ==========================================
 class LancetBlockConfigurable(nn.Module):
     def __init__(
-        self, hidden_dim, num_experts, world_size, group, block_name, pre_op_module, post_op_module
+        self,
+        hidden_dim,
+        num_experts,
+        world_size,
+        group,
+        block_name,
+        pre_op_module,
+        post_op_module,
+        streams,
     ):
         super().__init__()
         self.block_name = block_name
@@ -75,25 +83,17 @@ class LancetBlockConfigurable(nn.Module):
         self.group = group
         self.world_size = world_size
 
-        # Pre-MoE Norm (Standard Transformer Pre-Norm for the FFN/MoE layer)
+        # --- Shared Streams (Passed from Model) ---
+        self.stream_compute = streams["compute"]
+        self.stream_comm = streams["comm"]
+        self.stream_expert = streams["expert"]
+
+        # Modules
         self.moe_norm = nn.LayerNorm(hidden_dim)
-
-        # Pre-Op: Can be Attention, or Identity (if passed None)
         self.pre_ops = pre_op_module if pre_op_module else nn.Identity()
-
-        # Gating
         self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
-
-        # Experts
         self.experts = nn.ModuleList([Expert(hidden_dim) for _ in range(self.num_local_experts)])
-
-        # Post-Ops (Next Layer)
         self.post_ops = post_op_module if post_op_module else nn.Identity()
-
-        # Streams
-        self.stream_compute = torch.cuda.Stream()
-        self.stream_comm = torch.cuda.Stream()
-        self.stream_expert = torch.cuda.Stream()
 
     def forward(self, x):
         B, S, D = x.shape
@@ -110,7 +110,7 @@ class LancetBlockConfigurable(nn.Module):
         total_ticks = MICRO_BATCHES + 4
 
         for tick in range(total_ticks):
-            # --- Stage 5: Post-Ops (Compute Stream) ---
+            # --- Stage 5: Post-Ops (Shared Compute Stream) ---
             mb_post = tick - 4
             if 0 <= mb_post < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_post]
@@ -121,27 +121,18 @@ class LancetBlockConfigurable(nn.Module):
 
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
-                        # 1. Retrieve MoE Result
+                        # 1. Residual Add (Standard Transformer: x + MoE(x))
                         moe_out = buf["combined_output"]
-
-                        # 2. Retrieve Residual (Input to MoE)
                         residual = buf["gated_input"]
-
-                        # 3. Apply Residual Connection: x + MoE(Norm(x))
-                        # Note: We applied Norm in Stage 1 before sending.
-                        # So combined_output is Experts(Norm(x)).
-                        # We add it to un-normed residual 'gated_input'.
                         post_moe_out = residual + moe_out
 
-                        # 4. Reshape for Next Layer
+                        # 2. Next Layer
                         mb_size = chunks[mb_post].size(0)
                         reshaped_in = post_moe_out.view(mb_size, S, D)
-
-                        # 5. Run Next Layer (Post Ops)
                         outputs[mb_post] = self.post_ops(reshaped_in)
                     torch.cuda.nvtx.range_pop()
 
-            # --- Stage 4: Combine A2A (Comm Stream) ---
+            # --- Stage 4: Combine A2A (Shared Comm Stream) ---
             mb_comb = tick - 3
             if 0 <= mb_comb < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_comb]
@@ -160,7 +151,7 @@ class LancetBlockConfigurable(nn.Module):
                     torch.cuda.nvtx.range_pop()
                 ev_combine_ready[mb_comb].record(self.stream_comm)
 
-            # --- Stage 3: Experts (Expert Stream) ---
+            # --- Stage 3: Experts (Shared Expert Stream) ---
             mb_exp = tick - 2
             if 0 <= mb_exp < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_exp]
@@ -176,7 +167,7 @@ class LancetBlockConfigurable(nn.Module):
                     torch.cuda.nvtx.range_pop()
                 ev_expert_ready[mb_exp].record(self.stream_expert)
 
-            # --- Stage 2: Dispatch A2A (Comm Stream) ---
+            # --- Stage 2: Dispatch A2A (Shared Comm Stream) ---
             mb_disp = tick - 1
             if 0 <= mb_disp < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_disp]
@@ -185,7 +176,7 @@ class LancetBlockConfigurable(nn.Module):
                     label = f"{self.block_name}_Dispatch_MB{mb_disp}"
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
-                        real_in = buf["normed_input_flat"]  # Send the NORMED input
+                        real_in = buf["normed_input_flat"]
                         bloated_in = real_in.repeat(1, COMM_SCALING_FACTOR)
                         bloated_out = torch.empty_like(bloated_in)
                         dist.all_to_all_single(
@@ -195,7 +186,7 @@ class LancetBlockConfigurable(nn.Module):
                     torch.cuda.nvtx.range_pop()
                 ev_dispatch_ready[mb_disp].record(self.stream_comm)
 
-            # --- Stage 1: Pre-Ops + Gate (Compute Stream) ---
+            # --- Stage 1: Pre-Ops + Gate (Shared Compute Stream) ---
             mb_pre = tick
             if 0 <= mb_pre < MICRO_BATCHES:
                 with torch.cuda.stream(self.stream_compute):
@@ -207,39 +198,45 @@ class LancetBlockConfigurable(nn.Module):
                     with record_function(label):
                         x_chunk = chunks[mb_pre]
 
-                        # 1. Run Pre-Op (e.g., Attention L)
-                        # This returns x + Attn(Norm(x)) if it is RealSelfAttention
+                        # Pre-Op (e.g., Attn L)
                         x_proc = self.pre_ops(x_chunk)
 
-                        # 2. Save Residual (x_proc is the input to the MoE block)
+                        # Save for Residual (x + MoE)
                         x_flat = x_proc.view(-1, D)
-                        pipeline_buffers[mb_pre]["gated_input"] = (
-                            x_flat.clone()
-                        )  # Keep un-normed for residual add later
+                        pipeline_buffers[mb_pre]["gated_input"] = x_flat.clone()
 
-                        # 3. Apply Pre-MoE Norm
-                        # Standard Pre-Norm: MoE(Norm(x))
+                        # MoE Pre-Norm
                         x_normed = self.moe_norm(x_proc).view(-1, D)
                         pipeline_buffers[mb_pre]["normed_input_flat"] = x_normed
 
-                        # 4. Gate (using Normed input)
+                        # Gate
                         logits = self.gate(x_normed)
                         _, _ = torch.topk(logits, k=TOP_K, dim=1)
 
                     torch.cuda.nvtx.range_pop()
                 ev_pre_ready[mb_pre].record(self.stream_compute)
 
+        # Sync the specific compute stream used by this block before returning to Python
+        # so the next block's setup doesn't race on CPU
         torch.cuda.current_stream().wait_stream(self.stream_compute)
         return torch.cat(outputs, dim=0)
 
 
 # ==========================================
-# 2-Block Tiny Lancet Model
+# 2-Block Tiny Lancet Model (Creates Streams)
 # ==========================================
 class TinyLancetModel(nn.Module):
     def __init__(self, hidden_dim, num_experts, world_size, group):
         super().__init__()
         self.input_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # --- Create Shared Streams ---
+        # NOTE: Created on current device (handled by worker setup)
+        self.streams = {
+            "compute": torch.cuda.Stream(),
+            "comm": torch.cuda.Stream(),
+            "expert": torch.cuda.Stream(),
+        }
 
         # Block 1
         self.block1 = LancetBlockConfigurable(
@@ -250,6 +247,7 @@ class TinyLancetModel(nn.Module):
             block_name="B1",
             pre_op_module=RealSelfAttention(hidden_dim, 32),
             post_op_module=RealSelfAttention(hidden_dim, 32),
+            streams=self.streams,  # Pass streams
         )
 
         # Block 2
@@ -261,6 +259,7 @@ class TinyLancetModel(nn.Module):
             block_name="B2",
             pre_op_module=None,
             post_op_module=nn.Linear(hidden_dim, hidden_dim),
+            streams=self.streams,  # Pass streams
         )
 
     def forward(self, x):
@@ -275,7 +274,7 @@ class TinyLancetModel(nn.Module):
 # ==========================================
 def worker(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12369"
+    os.environ["MASTER_PORT"] = "12370"
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
@@ -288,11 +287,10 @@ def worker(rank, world_size):
     def trace_handler(p):
         dist.barrier()
         if rank == 0:
-            abs_path = os.path.abspath("lancet_residual_corrected.json")
+            abs_path = os.path.abspath("lancet_shared_streams.json")
             p.export_chrome_trace(abs_path)
             print(f"\n[Rank 0] Trace saved to: {abs_path}")
 
-    # Warmup
     if rank == 0:
         print("[Rank 0] Warming up...")
     for _ in range(WARMUP_STEPS):
@@ -302,7 +300,7 @@ def worker(rank, world_size):
         optimizer.zero_grad()
 
     if rank == 0:
-        print("[Rank 0] Profiling with Residuals...")
+        print("[Rank 0] Profiling Shared Streams...")
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=schedule(wait=1, warmup=1, active=ACTIVE_STEPS, repeat=1),
