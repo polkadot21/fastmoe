@@ -12,7 +12,7 @@ from torch.profiler import ProfilerActivity, profile, record_function, schedule
 # Configuration
 # ==========================================
 BATCH_SIZE = 128
-MICRO_BATCHES = 2
+MICRO_BATCHES = 4
 HIDDEN_DIM = 4096
 NUM_HEADS = 32
 NUM_EXPERTS_PER_GPU = 2
@@ -47,7 +47,7 @@ class RealSelfAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
         out = self.o_proj(out)
-        return out + residual
+        return out + residual  # Residual 1 is handled here
 
 
 class Expert(nn.Module):
@@ -62,38 +62,32 @@ class Expert(nn.Module):
 
 
 # ==========================================
-# Flexible Lancet Block
+# Configurable Lancet Block
 # ==========================================
 class LancetBlockConfigurable(nn.Module):
     def __init__(
-        self,
-        hidden_dim,
-        num_experts,
-        world_size,
-        group,
-        layer_id,
-        use_pre_attn=True,
-        post_op_module=None,
+        self, hidden_dim, num_experts, world_size, group, block_name, pre_op_module, post_op_module
     ):
         super().__init__()
-        self.layer_id = layer_id
-        self.use_pre_attn = use_pre_attn
+        self.block_name = block_name
         self.hidden_dim = hidden_dim
         self.num_local_experts = num_experts // world_size
         self.group = group
         self.world_size = world_size
 
-        # 1. Pre-Ops
-        if self.use_pre_attn:
-            self.attn = RealSelfAttention(hidden_dim, 32)
+        # Pre-MoE Norm (Standard Transformer Pre-Norm for the FFN/MoE layer)
+        self.moe_norm = nn.LayerNorm(hidden_dim)
 
-        # Gating always runs
+        # Pre-Op: Can be Attention, or Identity (if passed None)
+        self.pre_ops = pre_op_module if pre_op_module else nn.Identity()
+
+        # Gating
         self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
 
-        # 2. Experts
+        # Experts
         self.experts = nn.ModuleList([Expert(hidden_dim) for _ in range(self.num_local_experts)])
 
-        # 3. Post-Ops (Passed from outside to allow chaining/Output layer)
+        # Post-Ops (Next Layer)
         self.post_ops = post_op_module if post_op_module else nn.Identity()
 
         # Streams
@@ -102,14 +96,12 @@ class LancetBlockConfigurable(nn.Module):
         self.stream_expert = torch.cuda.Stream()
 
     def forward(self, x):
-        # x shape: [Batch, Seq, Dim]
         B, S, D = x.shape
         chunks = x.chunk(MICRO_BATCHES, dim=0)
 
         pipeline_buffers = [{} for _ in range(MICRO_BATCHES)]
         outputs = [None] * MICRO_BATCHES
 
-        # Events
         ev_pre_ready = [torch.cuda.Event() for _ in range(MICRO_BATCHES)]
         ev_dispatch_ready = [torch.cuda.Event() for _ in range(MICRO_BATCHES)]
         ev_expert_ready = [torch.cuda.Event() for _ in range(MICRO_BATCHES)]
@@ -124,13 +116,28 @@ class LancetBlockConfigurable(nn.Module):
                 buf = pipeline_buffers[mb_post]
                 self.stream_compute.wait_event(ev_combine_ready[mb_post])
                 with torch.cuda.stream(self.stream_compute):
-                    label = f"L{self.layer_id}_PostOps_MB{mb_post}"
+                    op_name = self.post_ops.__class__.__name__
+                    label = f"{self.block_name}_Post_{op_name}_MB{mb_post}"
+
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
-                        # Reshape for Attention/Linear
-                        flat_out = buf["combined_output"]
+                        # 1. Retrieve MoE Result
+                        moe_out = buf["combined_output"]
+
+                        # 2. Retrieve Residual (Input to MoE)
+                        residual = buf["gated_input"]
+
+                        # 3. Apply Residual Connection: x + MoE(Norm(x))
+                        # Note: We applied Norm in Stage 1 before sending.
+                        # So combined_output is Experts(Norm(x)).
+                        # We add it to un-normed residual 'gated_input'.
+                        post_moe_out = residual + moe_out
+
+                        # 4. Reshape for Next Layer
                         mb_size = chunks[mb_post].size(0)
-                        reshaped_in = flat_out.view(mb_size, S, D)
+                        reshaped_in = post_moe_out.view(mb_size, S, D)
+
+                        # 5. Run Next Layer (Post Ops)
                         outputs[mb_post] = self.post_ops(reshaped_in)
                     torch.cuda.nvtx.range_pop()
 
@@ -140,7 +147,7 @@ class LancetBlockConfigurable(nn.Module):
                 buf = pipeline_buffers[mb_comb]
                 self.stream_comm.wait_event(ev_expert_ready[mb_comb])
                 with torch.cuda.stream(self.stream_comm):
-                    label = f"L{self.layer_id}_Combine_MB{mb_comb}"
+                    label = f"{self.block_name}_Combine_MB{mb_comb}"
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
                         real_in = buf["expert_output"]
@@ -159,7 +166,7 @@ class LancetBlockConfigurable(nn.Module):
                 buf = pipeline_buffers[mb_exp]
                 self.stream_expert.wait_event(ev_dispatch_ready[mb_exp])
                 with torch.cuda.stream(self.stream_expert):
-                    label = f"L{self.layer_id}_Expert_MB{mb_exp}"
+                    label = f"{self.block_name}_Experts_MB{mb_exp}"
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
                         inp = buf["dispatch_output"]
@@ -175,10 +182,10 @@ class LancetBlockConfigurable(nn.Module):
                 buf = pipeline_buffers[mb_disp]
                 self.stream_comm.wait_event(ev_pre_ready[mb_disp])
                 with torch.cuda.stream(self.stream_comm):
-                    label = f"L{self.layer_id}_Dispatch_MB{mb_disp}"
+                    label = f"{self.block_name}_Dispatch_MB{mb_disp}"
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
-                        real_in = buf["gated_input"]
+                        real_in = buf["normed_input_flat"]  # Send the NORMED input
                         bloated_in = real_in.repeat(1, COMM_SCALING_FACTOR)
                         bloated_out = torch.empty_like(bloated_in)
                         dist.all_to_all_single(
@@ -188,26 +195,37 @@ class LancetBlockConfigurable(nn.Module):
                     torch.cuda.nvtx.range_pop()
                 ev_dispatch_ready[mb_disp].record(self.stream_comm)
 
-            # --- Stage 1: Pre-Ops (Compute Stream) ---
+            # --- Stage 1: Pre-Ops + Gate (Compute Stream) ---
             mb_pre = tick
             if 0 <= mb_pre < MICRO_BATCHES:
                 with torch.cuda.stream(self.stream_compute):
-                    label = f"L{self.layer_id}_PreOps_MB{mb_pre}"
+                    is_identity = isinstance(self.pre_ops, nn.Identity)
+                    op_desc = "GateOnly" if is_identity else "Attn_Gate"
+                    label = f"{self.block_name}_Pre_{op_desc}_MB{mb_pre}"
+
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
                         x_chunk = chunks[mb_pre]
 
-                        # Conditional Attention (Skip if Block 2)
-                        if self.use_pre_attn:
-                            x_proc = self.attn(x_chunk)
-                        else:
-                            x_proc = x_chunk  # Already Attended
+                        # 1. Run Pre-Op (e.g., Attention L)
+                        # This returns x + Attn(Norm(x)) if it is RealSelfAttention
+                        x_proc = self.pre_ops(x_chunk)
 
+                        # 2. Save Residual (x_proc is the input to the MoE block)
                         x_flat = x_proc.view(-1, D)
-                        logits = self.gate(x_flat)
+                        pipeline_buffers[mb_pre]["gated_input"] = (
+                            x_flat.clone()
+                        )  # Keep un-normed for residual add later
+
+                        # 3. Apply Pre-MoE Norm
+                        # Standard Pre-Norm: MoE(Norm(x))
+                        x_normed = self.moe_norm(x_proc).view(-1, D)
+                        pipeline_buffers[mb_pre]["normed_input_flat"] = x_normed
+
+                        # 4. Gate (using Normed input)
+                        logits = self.gate(x_normed)
                         _, _ = torch.topk(logits, k=TOP_K, dim=1)
 
-                        pipeline_buffers[mb_pre]["gated_input"] = x_flat.clone()
                     torch.cuda.nvtx.range_pop()
                 ev_pre_ready[mb_pre].record(self.stream_compute)
 
@@ -216,41 +234,39 @@ class LancetBlockConfigurable(nn.Module):
 
 
 # ==========================================
-# Tiny Model Container
+# 2-Block Tiny Lancet Model
 # ==========================================
 class TinyLancetModel(nn.Module):
     def __init__(self, hidden_dim, num_experts, world_size, group):
         super().__init__()
-        self.input_proj = nn.Linear(hidden_dim, hidden_dim)  # Linear Input Layer
+        self.input_proj = nn.Linear(hidden_dim, hidden_dim)
 
-        # Block 1: Computes Attn L (Pre) and Attn L+1 (Post)
-        # Post-Op is RealSelfAttention (Attn L+1)
+        # Block 1
         self.block1 = LancetBlockConfigurable(
             hidden_dim,
             num_experts,
             world_size,
             group,
-            layer_id=1,
-            use_pre_attn=True,
+            block_name="B1",
+            pre_op_module=RealSelfAttention(hidden_dim, 32),
             post_op_module=RealSelfAttention(hidden_dim, 32),
         )
 
-        # Block 2: Takes Attn L+1 Output. Skips Pre-Attn.
-        # Post-Op is Linear Output (to hide Combine)
+        # Block 2
         self.block2 = LancetBlockConfigurable(
             hidden_dim,
             num_experts,
             world_size,
             group,
-            layer_id=2,
-            use_pre_attn=False,  # Input is already attended!
-            post_op_module=nn.Linear(hidden_dim, hidden_dim),  # Linear Output Block
+            block_name="B2",
+            pre_op_module=None,
+            post_op_module=nn.Linear(hidden_dim, hidden_dim),
         )
 
     def forward(self, x):
         x = self.input_proj(x)
-        x = self.block1(x)  # Returns Attn(L+1) output
-        x = self.block2(x)  # Returns Linear Output
+        x = self.block1(x)
+        x = self.block2(x)
         return x
 
 
@@ -259,7 +275,7 @@ class TinyLancetModel(nn.Module):
 # ==========================================
 def worker(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12367"
+    os.environ["MASTER_PORT"] = "12369"
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
@@ -272,7 +288,7 @@ def worker(rank, world_size):
     def trace_handler(p):
         dist.barrier()
         if rank == 0:
-            abs_path = os.path.abspath("lancet_tiny_model_chain.json")
+            abs_path = os.path.abspath("lancet_residual_corrected.json")
             p.export_chrome_trace(abs_path)
             print(f"\n[Rank 0] Trace saved to: {abs_path}")
 
@@ -286,7 +302,7 @@ def worker(rank, world_size):
         optimizer.zero_grad()
 
     if rank == 0:
-        print("[Rank 0] Profiling 2-Block Chain...")
+        print("[Rank 0] Profiling with Residuals...")
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=schedule(wait=1, warmup=1, active=ACTIVE_STEPS, repeat=1),
