@@ -5,14 +5,16 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.nn.functional as F  # For Flash Attention
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 # ==========================================
 # Configuration
 # ==========================================
 BATCH_SIZE = 128
-MICRO_BATCHES = 4
+MICRO_BATCHES = 2
 HIDDEN_DIM = 4096
+NUM_HEADS = 32
 NUM_EXPERTS_PER_GPU = 2
 TOP_K = 2
 WARMUP_STEPS = 5
@@ -26,6 +28,46 @@ COMM_SCALING_FACTOR = 20
 # ==========================================
 # Model Definition
 # ==========================================
+class RealSelfAttention(nn.Module):
+    """
+    Realistic Multi-Head Attention using PyTorch SDPA (Flash Attention).
+    Used for Pre-Ops (Layer L) and Post-Ops (Layer L+1).
+    """
+
+    def __init__(self, hidden_dim, num_heads):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        assert self.head_dim * num_heads == hidden_dim, "Hidden dim must be divisible by num heads"
+
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x):
+        # Input x: [Batch, SeqLen, Dim]
+        B, S, D = x.shape
+        residual = x
+        x = self.norm(x)
+
+        # Projections
+        q = self.q_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Flash Attention (Hardware aware: uses FlashAttn or MemEfficient automatically)
+        # dropout_p=0.0 for profiling stability
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+
+        out = out.transpose(1, 2).contiguous().view(B, S, D)
+        out = self.o_proj(out)
+        return out + residual
+
+
 class Expert(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -45,16 +87,16 @@ class LancetBlockFull(nn.Module):
         self.world_size = world_size
         self.group = group
 
-        # 1. Pre-Ops
-        self.attn_norm = nn.LayerNorm(hidden_dim)
-        self.attn = nn.Linear(hidden_dim, hidden_dim)
+        # 1. Pre-Ops: Real Self-Attention (Layer L) + Gate
+        self.attn = RealSelfAttention(hidden_dim, NUM_HEADS)
         self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
 
-        # 2. Experts
+        # 2. Experts: Real MLP Experts
         self.experts = nn.ModuleList([Expert(hidden_dim) for _ in range(self.num_local_experts)])
 
-        # 3. Post-Ops
-        self.next_layer_ops = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU())
+        # 3. Post-Ops: Real Self-Attention (Layer L+1)
+        # In Lancet "Forward Extension", we overlap the NEXT layer's attention
+        self.next_layer_attn = RealSelfAttention(hidden_dim, NUM_HEADS)
 
         # Streams
         self.stream_compute = torch.cuda.Stream()
@@ -62,9 +104,11 @@ class LancetBlockFull(nn.Module):
         self.stream_expert = torch.cuda.Stream()
 
     def forward(self, x):
+        # x: [Batch, SeqLen, Dim]
         B, S, D = x.shape
-        x_flat = x.view(B * S, D)
-        chunks = x_flat.chunk(MICRO_BATCHES)
+
+        # We must chunk along Batch dimension to preserve Sequence for Attention
+        chunks = x.chunk(MICRO_BATCHES, dim=0)
 
         pipeline_buffers = [{} for _ in range(MICRO_BATCHES)]
         outputs = [None] * MICRO_BATCHES
@@ -78,6 +122,7 @@ class LancetBlockFull(nn.Module):
 
         for tick in range(total_ticks):
             # --- Stage 5: Post-Ops (Compute Stream) ---
+            # Real Operation: Next Layer Self-Attention
             mb_post = tick - 4
             if 0 <= mb_post < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_post]
@@ -86,7 +131,12 @@ class LancetBlockFull(nn.Module):
                 with torch.cuda.stream(self.stream_compute):
                     torch.cuda.nvtx.range_push(f"PostOps_MB{mb_post}")
                     with record_function(f"PostOps_MB{mb_post}"):
-                        out = self.next_layer_ops(buf["combined_output"])
+                        # Reshape flattened tokens back to (MicroBatch, Seq, Dim) for Attn
+                        flat_out = buf["combined_output"]
+                        mb_size = chunks[mb_post].size(0)  # Get original microbatch size
+                        reshaped_in = flat_out.view(mb_size, S, D)
+
+                        out = self.next_layer_attn(reshaped_in)
                         outputs[mb_post] = out
                     torch.cuda.nvtx.range_pop()
 
@@ -97,26 +147,22 @@ class LancetBlockFull(nn.Module):
                 self.stream_comm.wait_event(ev_expert_ready[mb_comb])
 
                 with torch.cuda.stream(self.stream_comm):
-                    # NVTX Annotations for the Timeline
                     torch.cuda.nvtx.range_push(f"A2A_Combine_MB{mb_comb}")
                     with record_function(f"A2A_Combine_MB{mb_comb}"):
-                        # --- Dead Weight Injection ---
-                        # We inflate the tensor size to slow down communication
-                        # Real input: buf['expert_output']
                         real_input = buf["expert_output"]
 
-                        # Create bloated tensor (Repeat data on last dim)
+                        # --- Dead Weight Injection ---
                         bloated_input = real_input.repeat(1, COMM_SCALING_FACTOR)
                         bloated_output = torch.empty_like(bloated_input)
 
-                        # Perform the Slow A2A
                         dist.all_to_all_single(
-                            bloated_output, bloated_input, group=self.group, async_op=False
+                            bloated_output,
+                            bloated_input,
+                            group=self.group,
+                            async_op=False,
                         )
 
-                        # Discard padded data, keep original size for next steps
-                        # (In a real run we'd split bloated_output, but this is for profiling visuals) # noqa
-                        # We just reconstruct the 'expected' shape to keep pipeline valid
+                        # Reconstruct valid pipeline data
                         buf["combined_output"] = torch.empty_like(real_input)
 
                     torch.cuda.nvtx.range_pop()
@@ -132,6 +178,7 @@ class LancetBlockFull(nn.Module):
                     torch.cuda.nvtx.range_push(f"Expert_MB{mb_exp}")
                     with record_function(f"Expert_MB{mb_exp}"):
                         inp = buf["dispatch_output"]
+                        # Run Experts on flattened tokens
                         local_splits = inp.chunk(self.num_local_experts)
                         res = [
                             self.experts[i](local_splits[i]) for i in range(self.num_local_experts)
@@ -156,35 +203,45 @@ class LancetBlockFull(nn.Module):
                         bloated_input = real_input.repeat(1, COMM_SCALING_FACTOR)
                         bloated_output = torch.empty_like(bloated_input)
 
-                        # Slow A2A
                         dist.all_to_all_single(
-                            bloated_output, bloated_input, group=self.group, async_op=False
+                            bloated_output,
+                            bloated_input,
+                            group=self.group,
+                            async_op=False,
                         )
 
-                        # Restore logical shape for pipeline continuity
                         pipeline_buffers[mb_disp]["dispatch_output"] = torch.empty_like(real_input)
 
                     torch.cuda.nvtx.range_pop()
                 ev_dispatch_ready[mb_disp].record(self.stream_comm)
 
             # --- Stage 1: Pre-Ops (Compute Stream) ---
+            # Real Operation: Layer L Self-Attention
             mb_pre = tick
             if 0 <= mb_pre < MICRO_BATCHES:
                 with torch.cuda.stream(self.stream_compute):
                     torch.cuda.nvtx.range_push(f"PreOps_MB{mb_pre}")
                     with record_function(f"PreOps_MB{mb_pre}"):
-                        x_chunk = chunks[mb_pre]
-                        x_attn = self.attn(self.attn_norm(x_chunk)) + x_chunk
-                        logits = self.gate(x_attn)
+                        x_chunk = chunks[mb_pre]  # Shape: [MB_Size, Seq, Dim]
+
+                        # Real Attention (Flash)
+                        x_attn = self.attn(x_chunk)
+
+                        # Flatten for Gating/MoE: [MB_Size * Seq, Dim]
+                        # (Gating typically works on individual tokens)
+                        x_flat = x_attn.view(-1, D)
+
+                        logits = self.gate(x_flat)
                         _, indices = torch.topk(logits, k=TOP_K, dim=1)
-                        gated = x_attn.clone()
+
+                        gated = x_flat.clone()
                         pipeline_buffers[mb_pre]["gated_input"] = gated
                     torch.cuda.nvtx.range_pop()
                 ev_pre_ready[mb_pre].record(self.stream_compute)
 
         torch.cuda.current_stream().wait_stream(self.stream_compute)
         final_out = torch.cat(outputs, dim=0)
-        return final_out.view(B, S, D)
+        return final_out
 
 
 # ==========================================
@@ -192,7 +249,7 @@ class LancetBlockFull(nn.Module):
 # ==========================================
 def worker(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12360"  # New port
+    os.environ["MASTER_PORT"] = "12365"  # Unique port
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
@@ -200,15 +257,18 @@ def worker(rank, world_size):
         HIDDEN_DIM, NUM_EXPERTS_PER_GPU * world_size, world_size, dist.group.WORLD
     ).cuda()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    # Data: [Batch, SeqLen, Dim]
     data = torch.randn(BATCH_SIZE, 128, HIDDEN_DIM).cuda()
 
     def trace_handler(p):
         dist.barrier()
         if rank == 0:
             p.add_metadata(
-                "Config", f"MB={MICRO_BATCHES}, GPUs={world_size}, CommScale={COMM_SCALING_FACTOR}"
+                "Config",
+                f"MB={MICRO_BATCHES}, GPUs={world_size}, Scale={COMM_SCALING_FACTOR}, FlashAttn=True",  # noqa
             )
-            abs_path = os.path.abspath("lancet_balanced_overlap.json")
+            abs_path = os.path.abspath("lancet_real_ops_overlap.json")
             p.export_chrome_trace(abs_path)
             print(f"\n[Rank 0] Trace saved to: {abs_path}")
 
@@ -222,7 +282,7 @@ def worker(rank, world_size):
         optimizer.zero_grad()
 
     if rank == 0:
-        print(f"[Rank 0] Profiling with {COMM_SCALING_FACTOR}x Communication Bloat...")
+        print(f"[Rank 0] Profiling with Real Flash Attention & {COMM_SCALING_FACTOR}x Comm...")
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=schedule(wait=1, warmup=1, active=ACTIVE_STEPS, repeat=1),
