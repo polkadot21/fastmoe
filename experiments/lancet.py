@@ -19,8 +19,8 @@ WARMUP_STEPS = 5
 ACTIVE_STEPS = 3
 
 # --- Dead Weight Config ---
-# We bloat communication by 5x to match the 45ms Expert Compute
-COMM_SCALING_FACTOR = 5
+# We bloat communication by 20x to match the Expert Compute
+COMM_SCALING_FACTOR = 20
 
 
 # ==========================================
