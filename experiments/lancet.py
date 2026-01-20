@@ -12,7 +12,7 @@ from torch.profiler import ProfilerActivity, profile, record_function, schedule
 # Configuration
 # ==========================================
 BATCH_SIZE = 128
-MICRO_BATCHES = 4
+MICRO_BATCHES = 2
 HIDDEN_DIM = 4096
 NUM_HEADS = 32
 NUM_EXPERTS_PER_GPU = 2
