@@ -89,7 +89,7 @@ class PipelineMoEBlock(nn.Module):
     def __init__(
         self,
         cfg: Config,
-        group,
+        group: dist.ProcessGroup,
         block_name: str,
         pre_op_module: SelfAttention | None,
         post_op_module: SelfAttention | nn.Linear | None,
@@ -368,7 +368,7 @@ class TinyModel(nn.Module):
     def __init__(
         self,
         cfg: Config,
-        group,
+        group: dist.ProcessGroup,
     ) -> None:
         super().__init__()
         self.cfg = cfg
