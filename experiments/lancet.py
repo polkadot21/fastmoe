@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
-import torch.nn.functional as F  # For Flash Attention
+import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 # ==========================================
@@ -19,28 +19,18 @@ NUM_EXPERTS_PER_GPU = 2
 TOP_K = 2
 WARMUP_STEPS = 5
 ACTIVE_STEPS = 3
-
-# --- Dead Weight Config ---
-# We bloat communication by 20x to match the Expert Compute
 COMM_SCALING_FACTOR = 20
 
 
 # ==========================================
-# Model Definition
+# Modules
 # ==========================================
 class RealSelfAttention(nn.Module):
-    """
-    Realistic Multi-Head Attention using PyTorch SDPA (Flash Attention).
-    """
-
     def __init__(self, hidden_dim, num_heads):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-
-        assert self.head_dim * num_heads == hidden_dim, "Hidden dim must be divisible by num heads"
-
         self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -48,20 +38,16 @@ class RealSelfAttention(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x):
-        # Input x: [Batch, SeqLen, Dim]
         B, S, D = x.shape
         residual = x
         x = self.norm(x)
-
         q = self.q_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
         out = self.o_proj(out)
-        return out + residual
+        return out + residual  # Residual 1
 
 
 class Expert(nn.Module):
@@ -75,31 +61,41 @@ class Expert(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
-class LancetBlockFull(nn.Module):
-    def __init__(self, hidden_dim, num_experts, world_size, group):
+# ==========================================
+# Configurable Lancet Block (Shared Streams)
+# ==========================================
+class LancetBlockConfigurable(nn.Module):
+    def __init__(
+        self,
+        hidden_dim,
+        num_experts,
+        world_size,
+        group,
+        block_name,
+        pre_op_module,
+        post_op_module,
+        streams,
+    ):
         super().__init__()
+        self.block_name = block_name
         self.hidden_dim = hidden_dim
         self.num_local_experts = num_experts // world_size
-        self.world_size = world_size
         self.group = group
+        self.world_size = world_size
 
-        # 1. Layer L: Real Self-Attention + Gate
-        self.attn = RealSelfAttention(hidden_dim, NUM_HEADS)
+        # --- Shared Streams (Passed from Model) ---
+        self.stream_compute = streams["compute"]
+        self.stream_comm = streams["comm"]
+        self.stream_expert = streams["expert"]
+
+        # Modules
+        self.moe_norm = nn.LayerNorm(hidden_dim)
+        self.pre_ops = pre_op_module if pre_op_module else nn.Identity()
         self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
-
-        # 2. Experts: Real MLP Experts
         self.experts = nn.ModuleList([Expert(hidden_dim) for _ in range(self.num_local_experts)])
-
-        # 3. Layer L+1: Real Self-Attention (Overlapped)
-        self.next_layer_attn = RealSelfAttention(hidden_dim, NUM_HEADS)
-
-        # Streams
-        self.stream_compute = torch.cuda.Stream()
-        self.stream_comm = torch.cuda.Stream()
-        self.stream_expert = torch.cuda.Stream()
+        self.post_ops = post_op_module if post_op_module else nn.Identity()
 
     def forward(self, x):
-        # x: [Batch, SeqLen, Dim]
         B, S, D = x.shape
         chunks = x.chunk(MICRO_BATCHES, dim=0)
 
@@ -114,155 +110,187 @@ class LancetBlockFull(nn.Module):
         total_ticks = MICRO_BATCHES + 4
 
         for tick in range(total_ticks):
-            # --- Stage 5: Attention Layer L+1 (Compute Stream) ---
+            # --- Stage 5: Post-Ops (Shared Compute Stream) ---
             mb_post = tick - 4
             if 0 <= mb_post < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_post]
                 self.stream_compute.wait_event(ev_combine_ready[mb_post])
-
                 with torch.cuda.stream(self.stream_compute):
-                    label = f"Attn_Layer_L+1_MB{mb_post}"
+                    op_name = self.post_ops.__class__.__name__
+                    label = f"{self.block_name}_Post_{op_name}_MB{mb_post}"
+
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
-                        flat_out = buf["combined_output"]
-                        mb_size = chunks[mb_post].size(0)
-                        reshaped_in = flat_out.view(mb_size, S, D)
+                        # 1. Residual Add (Standard Transformer: x + MoE(x))
+                        moe_out = buf["combined_output"]
+                        residual = buf["gated_input"]
+                        post_moe_out = residual + moe_out
 
-                        out = self.next_layer_attn(reshaped_in)
-                        outputs[mb_post] = out
+                        # 2. Next Layer
+                        mb_size = chunks[mb_post].size(0)
+                        reshaped_in = post_moe_out.view(mb_size, S, D)
+                        outputs[mb_post] = self.post_ops(reshaped_in)
                     torch.cuda.nvtx.range_pop()
 
-            # --- Stage 4: Combine A2A (Comm Stream) ---
+            # --- Stage 4: Combine A2A (Shared Comm Stream) ---
             mb_comb = tick - 3
             if 0 <= mb_comb < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_comb]
                 self.stream_comm.wait_event(ev_expert_ready[mb_comb])
-
                 with torch.cuda.stream(self.stream_comm):
-                    label = f"A2A_Combine_MB{mb_comb}"
+                    label = f"{self.block_name}_Combine_MB{mb_comb}"
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
-                        real_input = buf["expert_output"]
-
-                        # Dead Weight Injection
-                        bloated_input = real_input.repeat(1, COMM_SCALING_FACTOR)
-                        bloated_output = torch.empty_like(bloated_input)
-
+                        real_in = buf["expert_output"]
+                        bloated_in = real_in.repeat(1, COMM_SCALING_FACTOR)
+                        bloated_out = torch.empty_like(bloated_in)
                         dist.all_to_all_single(
-                            bloated_output,
-                            bloated_input,
-                            group=self.group,
-                            async_op=False,
+                            bloated_out, bloated_in, group=self.group, async_op=False
                         )
-
-                        buf["combined_output"] = torch.empty_like(real_input)
-
+                        buf["combined_output"] = torch.empty_like(real_in)
                     torch.cuda.nvtx.range_pop()
                 ev_combine_ready[mb_comb].record(self.stream_comm)
 
-            # --- Stage 3: MoE Experts (Expert Stream) ---
+            # --- Stage 3: Experts (Shared Expert Stream) ---
             mb_exp = tick - 2
             if 0 <= mb_exp < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_exp]
                 self.stream_expert.wait_event(ev_dispatch_ready[mb_exp])
-
                 with torch.cuda.stream(self.stream_expert):
-                    label = f"MoE_Experts_MB{mb_exp}"
+                    label = f"{self.block_name}_Experts_MB{mb_exp}"
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
                         inp = buf["dispatch_output"]
-                        local_splits = inp.chunk(self.num_local_experts)
-                        res = [
-                            self.experts[i](local_splits[i]) for i in range(self.num_local_experts)
-                        ]
+                        splits = inp.chunk(self.num_local_experts)
+                        res = [self.experts[i](splits[i]) for i in range(self.num_local_experts)]
                         buf["expert_output"] = torch.cat(res)
                     torch.cuda.nvtx.range_pop()
                 ev_expert_ready[mb_exp].record(self.stream_expert)
 
-            # --- Stage 2: Dispatch A2A (Comm Stream) ---
+            # --- Stage 2: Dispatch A2A (Shared Comm Stream) ---
             mb_disp = tick - 1
             if 0 <= mb_disp < MICRO_BATCHES:
                 buf = pipeline_buffers[mb_disp]
                 self.stream_comm.wait_event(ev_pre_ready[mb_disp])
-
                 with torch.cuda.stream(self.stream_comm):
-                    label = f"A2A_Dispatch_MB{mb_disp}"
+                    label = f"{self.block_name}_Dispatch_MB{mb_disp}"
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
-                        real_input = buf["gated_input"]
-                        pipeline_buffers[mb_disp]["dispatch_input"] = real_input
-
-                        # Dead Weight Injection
-                        bloated_input = real_input.repeat(1, COMM_SCALING_FACTOR)
-                        bloated_output = torch.empty_like(bloated_input)
-
+                        real_in = buf["normed_input_flat"]
+                        bloated_in = real_in.repeat(1, COMM_SCALING_FACTOR)
+                        bloated_out = torch.empty_like(bloated_in)
                         dist.all_to_all_single(
-                            bloated_output,
-                            bloated_input,
-                            group=self.group,
-                            async_op=False,
+                            bloated_out, bloated_in, group=self.group, async_op=False
                         )
-
-                        pipeline_buffers[mb_disp]["dispatch_output"] = torch.empty_like(real_input)
-
+                        pipeline_buffers[mb_disp]["dispatch_output"] = torch.empty_like(real_in)
                     torch.cuda.nvtx.range_pop()
                 ev_dispatch_ready[mb_disp].record(self.stream_comm)
 
-            # --- Stage 1: Attention Layer L (Compute Stream) ---
+            # --- Stage 1: Pre-Ops + Gate (Shared Compute Stream) ---
             mb_pre = tick
             if 0 <= mb_pre < MICRO_BATCHES:
                 with torch.cuda.stream(self.stream_compute):
-                    label = f"Attn_Layer_L_MB{mb_pre}"
+                    is_identity = isinstance(self.pre_ops, nn.Identity)
+                    op_desc = "GateOnly" if is_identity else "Attn_Gate"
+                    label = f"{self.block_name}_Pre_{op_desc}_MB{mb_pre}"
+
                     torch.cuda.nvtx.range_push(label)
                     with record_function(label):
                         x_chunk = chunks[mb_pre]
 
-                        x_attn = self.attn(x_chunk)
+                        # Pre-Op (e.g., Attn L)
+                        x_proc = self.pre_ops(x_chunk)
 
-                        # Flatten for Gating
-                        x_flat = x_attn.view(-1, D)
+                        # Save for Residual (x + MoE)
+                        x_flat = x_proc.view(-1, D)
+                        pipeline_buffers[mb_pre]["gated_input"] = x_flat.clone()
 
-                        logits = self.gate(x_flat)
-                        _, indices = torch.topk(logits, k=TOP_K, dim=1)
+                        # MoE Pre-Norm
+                        x_normed = self.moe_norm(x_proc).view(-1, D)
+                        pipeline_buffers[mb_pre]["normed_input_flat"] = x_normed
 
-                        gated = x_flat.clone()
-                        pipeline_buffers[mb_pre]["gated_input"] = gated
+                        # Gate
+                        logits = self.gate(x_normed)
+                        _, _ = torch.topk(logits, k=TOP_K, dim=1)
+
                     torch.cuda.nvtx.range_pop()
                 ev_pre_ready[mb_pre].record(self.stream_compute)
 
+        # Sync the specific compute stream used by this block before returning to Python
+        # so the next block's setup doesn't race on CPU
         torch.cuda.current_stream().wait_stream(self.stream_compute)
-        final_out = torch.cat(outputs, dim=0)
-        return final_out
+        return torch.cat(outputs, dim=0)
 
 
 # ==========================================
-# Worker Function
+# 2-Block Tiny Lancet Model (Creates Streams)
+# ==========================================
+class TinyLancetModel(nn.Module):
+    def __init__(self, hidden_dim, num_experts, world_size, group):
+        super().__init__()
+        self.input_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # --- Create Shared Streams ---
+        # NOTE: Created on current device (handled by worker setup)
+        self.streams = {
+            "compute": torch.cuda.Stream(),
+            "comm": torch.cuda.Stream(),
+            "expert": torch.cuda.Stream(),
+        }
+
+        # Block 1
+        self.block1 = LancetBlockConfigurable(
+            hidden_dim,
+            num_experts,
+            world_size,
+            group,
+            block_name="B1",
+            pre_op_module=RealSelfAttention(hidden_dim, 32),
+            post_op_module=RealSelfAttention(hidden_dim, 32),
+            streams=self.streams,  # Pass streams
+        )
+
+        # Block 2
+        self.block2 = LancetBlockConfigurable(
+            hidden_dim,
+            num_experts,
+            world_size,
+            group,
+            block_name="B2",
+            pre_op_module=None,
+            post_op_module=nn.Linear(hidden_dim, hidden_dim),
+            streams=self.streams,  # Pass streams
+        )
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.block1(x)
+        x = self.block2(x)
+        return x
+
+
+# ==========================================
+# Worker
 # ==========================================
 def worker(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12366"
+    os.environ["MASTER_PORT"] = "12370"
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    model = LancetBlockFull(
+    model = TinyLancetModel(
         HIDDEN_DIM, NUM_EXPERTS_PER_GPU * world_size, world_size, dist.group.WORLD
     ).cuda()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-
     data = torch.randn(BATCH_SIZE, 128, HIDDEN_DIM).cuda()
 
     def trace_handler(p):
         dist.barrier()
         if rank == 0:
-            p.add_metadata(
-                "Config",
-                f"MB={MICRO_BATCHES}, GPUs={world_size}, Scale={COMM_SCALING_FACTOR}, FlashAttn=True",  # noqa
-            )
-            abs_path = os.path.abspath("lancet_annotated_profile.json")
+            abs_path = os.path.abspath("lancet_shared_streams.json")
             p.export_chrome_trace(abs_path)
             print(f"\n[Rank 0] Trace saved to: {abs_path}")
 
-    # Warmup
     if rank == 0:
         print("[Rank 0] Warming up...")
     for _ in range(WARMUP_STEPS):
@@ -272,7 +300,7 @@ def worker(rank, world_size):
         optimizer.zero_grad()
 
     if rank == 0:
-        print("[Rank 0] Profiling with Annotated Real Ops...")
+        print("[Rank 0] Profiling Shared Streams...")
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=schedule(wait=1, warmup=1, active=ACTIVE_STEPS, repeat=1),
@@ -280,8 +308,7 @@ def worker(rank, world_size):
         record_shapes=True,
         with_stack=True,
     ) as p:
-        total_steps = 1 + 1 + ACTIVE_STEPS
-        for _ in range(total_steps):
+        for _ in range(1 + 1 + ACTIVE_STEPS):
             loss = model(data).sum()
             loss.backward()
             optimizer.step()
@@ -293,9 +320,6 @@ def worker(rank, world_size):
     dist.destroy_process_group()
 
 
-# ==========================================
-# Execution
-# ==========================================
 def run_experiment():
     world_size = 2
     print(f"Starting processes for {world_size} GPUs...")
