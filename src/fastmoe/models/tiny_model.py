@@ -468,19 +468,23 @@ class PipelineMoEBlock(nn.Module):
                 label = f"{self.block_name}_Bwd_Pre_MB{mb_idx}"
                 with record_function(label):
                     d_normed = buf["grad_normed"]
-                    d_resid = buf["grad_residual"]  # Comes from Post-Ops via buffer
-                    x_in = buf["input_pre"]  # This is 'x' from forward, attached to previous layers
+                    d_resid = buf["grad_residual"]  # This is 3D [B, S, D]
+                    x_in = buf["input_pre"]
 
                     with torch.enable_grad():
                         x_proc = self.pre_ops(x_in)
+                        # Residual (2D)
                         x_flat = x_proc.view(-1, self.hidden_dim)
+                        # Norm (2D)
                         x_normed = self.moe_norm(x_proc).view(-1, self.hidden_dim)
 
-                    # We are computing gradients w.r.t 'x_in' and PreOps parameters.
-                    # We have TWO gradients coming back: d_resid (from skip) and d_normed (from MoE path) # noqa
+                    # Flatten d_resid to match x_flat [Batch*Seq, Dim]
+                    d_resid_flat = d_resid.view(-1, self.hidden_dim)
+
                     grads = torch.autograd.grad(
                         outputs=(x_flat, x_normed),
-                        grad_outputs=(d_resid, d_normed),
+                        # Use flattened gradient
+                        grad_outputs=(d_resid_flat, d_normed),
                         inputs=(x_in,)
                         + tuple(self.pre_ops.parameters())
                         + tuple(self.moe_norm.parameters()),
