@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from loguru import logger
 from torch.profiler import ProfilerActivity, profile, schedule
 
-from fastmoe.config import Config, get_cfg
+from fastmoe.config import Config, MoEScale, get_cfg
 from fastmoe.models.tiny_model import TinyModel
 
 TRACE_FILENAME: typing.Final[str] = "pipelined_moe_with_comm_vs_compute_overlap.json"
@@ -28,7 +28,7 @@ def worker(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    cfg: Config = get_cfg()
+    cfg: Config = get_cfg(world_size=world_size, scale=MoEScale.TINY)
     log_rank0(rank, cfg)
 
     model = TinyModel(cfg, dist.group.WORLD).cuda()
