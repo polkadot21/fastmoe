@@ -16,7 +16,7 @@ TRACE_FILENAME: typing.Final[str] = "pipelined_moe_with_comm_vs_compute_overlap.
 
 def log_rank0(rank: int, msg: str | Config) -> None:
     if rank == 0:
-        logger.info(msg)
+        logger.info(msg) if isinstance(msg, str) else logger.info(str(msg))
 
 
 # ==========================================

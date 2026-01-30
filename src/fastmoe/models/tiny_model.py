@@ -126,7 +126,7 @@ class MoEOverlapFunction(Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
         #
-        block = ctx.block
+        block: PipelineMoEBlock = ctx.block
         fwd_ctx = ctx.fwd_ctx
 
         # Chunk Gradients
@@ -383,14 +383,18 @@ class PipelineMoEBlock(nn.Module):
                 with record_function(label):
                     d_moe = buf["grad_combined"]
 
+                    # Communication layers operate on flattened tokens.
+                    d_moe_flat = d_moe.view(-1, self.hidden_dim)
+
                     # Simulation Bloat
-                    bloated_in = d_moe.repeat(1, self.cfg.moe.comm_scaling_factor)
+                    bloated_in = d_moe_flat.repeat(1, self.cfg.moe.comm_scaling_factor)
                     bloated_out = torch.empty_like(bloated_in)
                     dist.all_to_all_single(
                         bloated_out, bloated_in, group=self.group, async_op=False
                     )
 
-                    buf["grad_expert_out"] = torch.empty_like(d_moe)
+                    # We must ensure the output shape matches what Experts expect (2D)
+                    buf["grad_expert_out"] = torch.empty_like(d_moe_flat)
 
             ev_signal[mb_idx].record(stream)
 
