@@ -125,8 +125,6 @@ class MoEOverlapFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, None]:
-        if not ctx.needs_input_grad[0]:
-            return None, None
         #
         block: PipelineMoEBlock = ctx.block
         fwd_ctx = ctx.fwd_ctx
@@ -161,6 +159,10 @@ class MoEOverlapFunction(Function):
 
         # Final Sync & Return
         torch.cuda.current_stream().wait_stream(block.streams[Streams.COMPUTE])
+
+        if not ctx.needs_input_grad[0]:
+            return None, None
+
         return torch.cat(dx_list, dim=0), None
 
 
@@ -480,7 +482,6 @@ class PipelineMoEBlock(nn.Module):
 
                     d_resid_flat = d_resid.view(-1, self.hidden_dim)
 
-                    # Add allow_unused=True because moe_norm is not used for x_flat
                     grads = torch.autograd.grad(
                         outputs=(x_flat, x_normed),
                         grad_outputs=(d_resid_flat, d_normed),
@@ -491,12 +492,17 @@ class PipelineMoEBlock(nn.Module):
                     )
 
                     d_x = grads[0]
+
+                    # Handle None gradient from allow_unused=True
+                    if d_x is None:
+                        d_x = torch.zeros_like(x_in)
+
                     d_params = grads[1:]
 
-                    # Accumulate Params with None check
+                    # Accumulate Params
                     all_params = list(self.pre_ops.parameters()) + list(self.moe_norm.parameters())
                     for p, g in zip(all_params, d_params, strict=False):
-                        if g is None:  # [FIX] Handle unused gradients
+                        if g is None:
                             continue
                         if p.grad is None:
                             p.grad = g
