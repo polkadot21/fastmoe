@@ -124,7 +124,9 @@ class MoEOverlapFunction(Function):
         return torch.cat(outputs, dim=0)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, None]:
+        if not ctx.needs_input_grad[0]:
+            return None, None
         #
         block: PipelineMoEBlock = ctx.block
         fwd_ctx = ctx.fwd_ctx
