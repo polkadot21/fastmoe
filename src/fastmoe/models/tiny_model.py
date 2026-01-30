@@ -468,34 +468,34 @@ class PipelineMoEBlock(nn.Module):
                 label = f"{self.block_name}_Bwd_Pre_MB{mb_idx}"
                 with record_function(label):
                     d_normed = buf["grad_normed"]
-                    d_resid = buf["grad_residual"]  # This is 3D [B, S, D]
+                    d_resid = buf["grad_residual"]
                     x_in = buf["input_pre"]
 
                     with torch.enable_grad():
                         x_proc = self.pre_ops(x_in)
-                        # Residual (2D)
                         x_flat = x_proc.view(-1, self.hidden_dim)
-                        # Norm (2D)
                         x_normed = self.moe_norm(x_proc).view(-1, self.hidden_dim)
 
-                    # Flatten d_resid to match x_flat [Batch*Seq, Dim]
                     d_resid_flat = d_resid.view(-1, self.hidden_dim)
 
+                    # Add allow_unused=True because moe_norm is not used for x_flat
                     grads = torch.autograd.grad(
                         outputs=(x_flat, x_normed),
-                        # Use flattened gradient
                         grad_outputs=(d_resid_flat, d_normed),
                         inputs=(x_in,)
                         + tuple(self.pre_ops.parameters())
                         + tuple(self.moe_norm.parameters()),
+                        allow_unused=True,
                     )
 
                     d_x = grads[0]
                     d_params = grads[1:]
 
-                    # Accumulate Params
+                    # Accumulate Params with None check
                     all_params = list(self.pre_ops.parameters()) + list(self.moe_norm.parameters())
                     for p, g in zip(all_params, d_params, strict=False):
+                        if g is None:  # [FIX] Handle unused gradients
+                            continue
                         if p.grad is None:
                             p.grad = g
                         else:
