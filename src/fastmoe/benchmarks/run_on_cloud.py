@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from loguru import logger
 from torch.profiler import ProfilerActivity, profile, schedule
 
-from fastmoe.config import Config, get_cfg
+from fastmoe.config import Config, MoEScale, get_cfg
 from fastmoe.models.tiny_model import TinyModel
 
 TRACE_FILENAME: typing.Final[str] = "pipelined_moe_with_comm_vs_compute_overlap.json"
@@ -16,7 +16,7 @@ TRACE_FILENAME: typing.Final[str] = "pipelined_moe_with_comm_vs_compute_overlap.
 
 def log_rank0(rank: int, msg: str | Config) -> None:
     if rank == 0:
-        logger.info(msg)
+        logger.info(msg) if isinstance(msg, str) else logger.info(str(msg))
 
 
 # ==========================================
@@ -28,12 +28,17 @@ def worker(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    cfg: Config = get_cfg()
+    cfg: Config = get_cfg(world_size=world_size, scale=MoEScale.TINY)
     log_rank0(rank, cfg)
 
     model = TinyModel(cfg, dist.group.WORLD).cuda()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    data = torch.randn(cfg.moe.batch_size, cfg.moe.seqlen, cfg.moe.hidden_dim).cuda()
+    data = torch.randn(
+        cfg.moe.batch_size,
+        cfg.moe.seqlen,
+        cfg.moe.hidden_dim,
+        requires_grad=True,
+    ).cuda()
 
     def trace_handler(p):
         dist.barrier()
