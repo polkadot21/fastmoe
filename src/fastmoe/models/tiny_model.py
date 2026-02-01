@@ -358,13 +358,11 @@ class PipelineMoEBlock(nn.Module):
 
                     # output[indices] += data
                     # Note: We must duplicate indices into [N, D] for scatter if D > 1?
-                    # No, index_add_ is better for this.
                     output_buffer.index_add_(0, valid_indices, valid_data)
 
                     # Compute
                     post_moe_out = residual + output_buffer
 
-                    # Reshape to sequence
                     B_mb = chunks[mb_idx].size(0)
                     reshaped_in = post_moe_out.view(B_mb, -1, self.hidden_dim)
 
@@ -375,9 +373,7 @@ class PipelineMoEBlock(nn.Module):
 
                     # Save for Backward
                     buf["input_post"] = reshaped_in
-                    buf["post_moe_out"] = (
-                        output_buffer  # Needed for backward logic? Or just reconstruct.
-                    )
+                    buf["combined_output_for_grad"] = moe_out  # [CRITICAL] Save for Weight Grad
 
     # =========================================================================
     # BACKWARD STAGES
@@ -422,7 +418,7 @@ class PipelineMoEBlock(nn.Module):
             ev_signal[mb_idx].record(stream)
 
     def _bwd_stage_combine(self, mb_idx, ctx, ev_wait, ev_signal):
-        """Stage 2 (Bwd): Grad Combine (Reverse Un-Permute) [COMM STREAM]"""
+        """Stage 2 (Bwd): Grad Combine [COMM STREAM]"""
         if 0 <= mb_idx < self.cfg.moe.micro_batches:
             stream = self.streams[Streams.COMM]
             buf = ctx[mb_idx]
@@ -436,12 +432,9 @@ class PipelineMoEBlock(nn.Module):
                     weights = buf["permuted_weights"]
                     capacity = buf["capacity"]
 
-                    # Reverse Scatter = Gather
-                    # We need d(weighted_moe) = d(output_buffer) gathered at indices
+                    moe_out = buf["combined_output_for_grad"]
 
-                    # 1. Gather Gradients
-                    # d_weighted_moe: [Slots, Dim]
-                    # Initialize with zeros (for padding slots)
+                    # 1. Gather Gradients (d_output -> d_weighted_moe)
                     d_weighted_moe = torch.zeros(
                         (gather_index.size(0), self.hidden_dim),
                         dtype=d_moe_scattered.dtype,
@@ -450,16 +443,19 @@ class PipelineMoEBlock(nn.Module):
 
                     valid_mask = gather_index != -1
                     valid_indices = gather_index[valid_mask]
-
-                    # d_weighted_moe[valid] = d_scattered[indices]
                     d_weighted_moe[valid_mask] = d_moe_scattered[valid_indices]
 
                     # 2. Backprop through Weight Mult
-                    # weighted_moe = moe_out * weights
                     # d_moe_out = d_weighted * weights
                     d_moe_out = d_weighted_moe * weights.unsqueeze(1)
 
-                    # 3. All-to-All (Reverse Combine)
+                    # Calculate Gradient for Gate Weights
+                    # d_weights = sum(d_weighted * moe_out, dim=1)
+                    # This tells the Router which expert was actually good
+                    d_permuted_weights = (d_weighted_moe * moe_out).sum(dim=1)
+                    buf["grad_permuted_weights"] = d_permuted_weights
+
+                    # 4. All-to-All (Reverse Combine)
                     tokens_per_rank = self.num_local_experts * capacity
                     reshaped_in = d_moe_out.view(
                         self.cfg.world_size, tokens_per_rank, self.hidden_dim
@@ -486,7 +482,7 @@ class PipelineMoEBlock(nn.Module):
                 with record_function(label):
                     # Input: [World*Local*Cap, Dim]
                     d_expert_out_flat = buf["grad_expert_out"]
-                    expert_input_grouped = buf["input_experts"]  # [Local, World*Cap, Dim]
+                    expert_input_grouped = buf["input_experts"]
                     capacity = buf["capacity"]
 
                     # We need to reverse the transpose logic from forward
@@ -497,14 +493,10 @@ class PipelineMoEBlock(nn.Module):
                     d_expert_out_4d = d_expert_out_flat.view(
                         self.cfg.world_size, self.num_local_experts, capacity, self.hidden_dim
                     )
-
-                    # 2. Transpose to [L, W, C, D] -> [L, W*C, D]
                     d_expert_out_grouped = d_expert_out_4d.transpose(0, 1).reshape(
                         self.num_local_experts, -1, self.hidden_dim
                     )
 
-                    # 3. Backward through Experts
-                    # We need to recreate the input graph
                     inp = expert_input_grouped.detach().requires_grad_(True)
 
                     with torch.enable_grad():
@@ -581,38 +573,40 @@ class PipelineMoEBlock(nn.Module):
                     x_in = buf["input_pre"]
                     gather_index = buf["gather_index"]
 
+                    d_permuted_weights = buf["grad_permuted_weights"]
+
                     with torch.enable_grad():
                         x_proc = self.pre_ops(x_in)
                         x_flat = x_proc.view(-1, self.hidden_dim)
                         x_normed = self.moe_norm(x_proc).view(-1, self.hidden_dim)
 
-                        # Re-run routing just to attach graph? No, Router is discrete.
-                        # We need to manually backprop through the permutation to x_normed.
+                        # Re-run Router to attach Graph for Gate Gradients
+                        # This creates 'permuted_weights_graph' which IS connected to 'self.router'
+                        _, permuted_weights_graph, _, _ = self.router(x_normed)
 
-                    # 1. Reverse Permutation (Grad of Scatter is Gather)
-                    # d_x_normed = zeros
-                    # d_x_normed[gather_idx] += d_permuted
-
+                    # 1. Reverse Permutation (Data Path)
                     d_normed = torch.zeros_like(x_normed)
-
-                    # We only gather from valid slots
                     valid_mask = gather_index != -1
                     valid_indices = gather_index[valid_mask]
                     valid_grads = d_permuted[valid_mask]
-
-                    # Accumulate gradients from the permuted buffer back to original tokens
                     d_normed.index_add_(0, valid_indices, valid_grads)
 
                     # 2. Flatten d_resid
                     d_resid_flat = d_resid.view(-1, self.hidden_dim)
 
-                    # 3. Autograd for PreOps
+                    # 3. Autograd
+                    # We compute gradients for:
+                    # - PreOps (via x_flat and x_normed data path)
+                    # - Norm (via x_normed data path)
+                    # - Router (via permuted_weights_graph)
+
                     grads = torch.autograd.grad(
-                        outputs=(x_flat, x_normed),
-                        grad_outputs=(d_resid_flat, d_normed),
+                        outputs=(x_flat, x_normed, permuted_weights_graph),
+                        grad_outputs=(d_resid_flat, d_normed, d_permuted_weights),
                         inputs=(x_in,)
                         + tuple(self.pre_ops.parameters())
-                        + tuple(self.moe_norm.parameters()),
+                        + tuple(self.moe_norm.parameters())
+                        + tuple(self.router.gate.parameters()),  # [NEW] Add Router Params
                         allow_unused=True,
                     )
 
@@ -621,7 +615,13 @@ class PipelineMoEBlock(nn.Module):
                         d_x = torch.zeros_like(x_in)
 
                     d_params = grads[1:]
-                    all_params = list(self.pre_ops.parameters()) + list(self.moe_norm.parameters())
+
+                    # List of all params including router
+                    all_params = (
+                        list(self.pre_ops.parameters())
+                        + list(self.moe_norm.parameters())
+                        + list(self.router.gate.parameters())
+                    )
 
                     for p, g in zip(all_params, d_params, strict=False):
                         if g is None:
