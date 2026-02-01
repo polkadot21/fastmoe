@@ -33,7 +33,7 @@ class MoESetup(BaseSettings):
     warmup_steps: int = 5
     active_steps: int = 3
 
-    comm_scaling_factor: int = 5
+    comm_scaling_factor: int = 1
 
 
 class Config(BaseSettings):

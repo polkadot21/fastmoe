@@ -207,12 +207,14 @@ def check_tensors(rank, name, t_pipe, t_ref, tol=1e-3):
 
 
 def worker(rank, world_size):
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "12375"
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    # [CRITICAL] Same Seed per rank
     torch.manual_seed(42 + rank)
 
     cfg = get_cfg(world_size=world_size, scale=MoEScale.TINY)
