@@ -168,8 +168,7 @@ def patch_pipeline_block(block):
     def wrapped_pre(self, mb_idx, ctx, chunks, ev_signal):
         # Call original
         orig_pre(mb_idx, ctx, chunks, ev_signal)
-        # Spy on output
-        if mb_idx == 0:  # Only spy on first microbatch to reduce noise
+        if mb_idx == 0:
             rank = dist.get_rank()
             spy(rank, "Pipe:Input", ctx[mb_idx]["gated_input"])  # This is x_flat
             spy(rank, "Pipe:Router", ctx[mb_idx]["permuted_inputs"])
@@ -202,7 +201,7 @@ def check_tensors(rank, name, t_pipe, t_ref, tol=1e-3):
         return True
     else:
         diff = (t_pipe - t_ref).abs().max().item()
-        logger.error(f"Rank {rank}: ❌ {name} Mismatch! Max Diff: {diff:.6f}")
+        logger.error(f"Rank {rank}: {name} Mismatch! Max Diff: {diff:.6f}")
         return False
 
 
@@ -283,7 +282,7 @@ def worker(rank, world_size):
             logger.info(f"Step {step}: Loss {loss.item():.6f}")
 
     if losses[-1] < losses[0]:
-        logger.info(f"Rank {rank}: ✅ Model Converges! {losses[0]:.4f} -> {losses[-1]:.4f}")
+        logger.info(f"Rank {rank}: Model Converges! {losses[0]:.4f} -> {losses[-1]:.4f}")
 
     dist.destroy_process_group()
 

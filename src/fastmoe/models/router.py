@@ -13,7 +13,7 @@ class TopKRouter(nn.Module):
         self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
 
     def forward(self, x: torch.Tensor):
-        # 1. Input Normalization (Handle 2D or 3D input)
+        # Input Normalization (Handle 2D or 3D input)
         # We need num_tokens for capacity calculation and x_flat for gating.
         if x.dim() == 2:
             # Input: [Tokens, Dim]
@@ -42,7 +42,7 @@ class TopKRouter(nn.Module):
         capacity = max(capacity, 4)
 
         # 5. Create Indexing Masks
-        # Goal: Map inputs[i] -> (Expert_E, Slot_S)
+        # Map inputs[i] -> (Expert_E, Slot_S)
 
         # A. Mask for each expert: [Tokens, K, Experts]
         expert_mask = F.one_hot(topk_indices, num_classes=self.num_experts).to(torch.int32)
@@ -56,8 +56,8 @@ class TopKRouter(nn.Module):
         valid_mask = (token_priority > 0) & (token_priority <= capacity)
 
         # 6. Calculate Final Gather Indices
-        # We need to map: (Expert_E, Slot_S) -> Input_Token_Index
-        # Result: index tensor of shape [Experts * Capacity] pointing to original tokens.
+        # Map: (Expert_E, Slot_S) -> Input_Token_Index
+        # index tensor of shape [Experts * Capacity] pointing to original tokens.
 
         # Flatten masks to [Tokens * K, Experts]
         valid_mask_flat = valid_mask.view(-1, self.num_experts)
@@ -69,7 +69,7 @@ class TopKRouter(nn.Module):
             (self.num_experts * capacity,), -1, dtype=torch.long, device=x.device
         )
 
-        # We need to map 'original_token_idx' to the destination slot.
+        # Map 'original_token_idx' to the destination slot.
         # original_token_idx repeats K times for the K choices.
         row_idx = (
             torch.arange(num_tokens * self.top_k, device=x.device)

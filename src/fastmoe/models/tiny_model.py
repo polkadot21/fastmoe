@@ -145,7 +145,7 @@ class PipelineMoEBlock(nn.Module):
         self.moe_norm = nn.LayerNorm(self.hidden_dim)
         self.pre_ops = pre_op_module if pre_op_module else nn.Identity()
 
-        # Use TopKRouter instead of simple Linear
+        # Use TopKRouter
         # Calculate total experts in the world
         total_experts = cfg.moe.num_experts_per_gpu * cfg.world_size
         self.router = TopKRouter(
@@ -357,7 +357,7 @@ class PipelineMoEBlock(nn.Module):
                     valid_data = weighted_moe[valid_mask]
 
                     # output[indices] += data
-                    # Note: We must duplicate indices into [N, D] for scatter if D > 1?
+                    # We must duplicate indices into [N, D] for scatter if D > 1?
                     output_buffer.index_add_(0, valid_indices, valid_data)
 
                     # Compute
