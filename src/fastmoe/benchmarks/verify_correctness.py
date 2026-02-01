@@ -17,6 +17,9 @@ from fastmoe.models.tiny_model import Expert, SelfAttention, TinyModel
 # ==========================================
 def spy(rank, stage_name, tensor):
     """Logs Mean/Std/Sum to catch drift."""
+
+    torch.cuda.synchronize()
+
     with torch.no_grad():
         t = tensor.detach().float()
         mean = t.mean().item()
@@ -73,7 +76,7 @@ class ReferenceMoEBlock(nn.Module):
         x_proc = self.pre_ops(x)
         x_normed = self.moe_norm(x_proc).view(-1, self.hidden_dim)
         x_flat = x_proc.view(-1, self.hidden_dim)
-        # spy(rank, "Ref:Input", x_flat)
+        spy(rank, "Ref:Input", x_flat)
 
         # 2. Router
         permuted_inputs, permuted_weights, gather_index, capacity = self.router(x_normed)
@@ -84,7 +87,7 @@ class ReferenceMoEBlock(nn.Module):
         reshaped_in = permuted_inputs.view(self.cfg.world_size, tokens_per_rank, self.hidden_dim)
         reshaped_out = DifferentiableAllToAll.apply(reshaped_in, self.group)
         dispatch_output = reshaped_out.view(-1, self.hidden_dim)
-        # spy(rank, "Ref:Dispatch", dispatch_output)
+        spy(rank, "Ref:Dispatch", dispatch_output)
 
         # 4. Experts
         view_4d = dispatch_output.view(
@@ -103,7 +106,7 @@ class ReferenceMoEBlock(nn.Module):
             len(self.experts), self.cfg.world_size, capacity, self.hidden_dim
         ).transpose(0, 1)
         expert_output = expert_out_4d.reshape(-1, self.hidden_dim)
-        # spy(rank, "Ref:Experts", expert_output)
+        spy(rank, "Ref:Experts", expert_output)
 
         # 5. Combine
         reshaped_in = expert_output.view(self.cfg.world_size, tokens_per_rank, self.hidden_dim)
@@ -168,7 +171,7 @@ def patch_pipeline_block(block):
         # Spy on output
         if mb_idx == 0:  # Only spy on first microbatch to reduce noise
             rank = dist.get_rank()
-            # spy(rank, "Pipe:Input", ctx[mb_idx]["gated_input"]) # This is x_flat
+            spy(rank, "Pipe:Input", ctx[mb_idx]["gated_input"])  # This is x_flat
             spy(rank, "Pipe:Router", ctx[mb_idx]["permuted_inputs"])
 
     def wrapped_combine(self, mb_idx, ctx, ev_wait, ev_signal):
