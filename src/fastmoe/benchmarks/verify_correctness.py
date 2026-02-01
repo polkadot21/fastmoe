@@ -75,6 +75,8 @@ class ReferenceMoEBlock(nn.Module):
         self.post_ops = post_op if post_op else nn.Identity()
 
     def forward(self, x):
+        rank = dist.get_rank()
+
         # 1. Pre-Ops
         x_proc = self.pre_ops(x)
         x_normed = self.moe_norm(x_proc).view(-1, self.hidden_dim)
@@ -82,7 +84,7 @@ class ReferenceMoEBlock(nn.Module):
 
         # 2. Route
         permuted_inputs, permuted_weights, gather_index, capacity = self.router(x_normed)
-        # spy(rank, "Ref Route Out", permuted_inputs)
+        spy(rank, "Ref Route Out", permuted_inputs)
 
         # 3. Dispatch
         tokens_per_rank = len(self.experts) * capacity
@@ -91,7 +93,7 @@ class ReferenceMoEBlock(nn.Module):
         # [FIX] Use Differentiable Communication
         reshaped_out = DifferentiableAllToAll.apply(reshaped_in, self.group)
         dispatch_output = reshaped_out.view(-1, self.hidden_dim)
-        # spy(rank, "Ref Disp Out", dispatch_output)
+        spy(rank, "Ref Disp Out", dispatch_output)
 
         # 4. Experts
         view_4d = dispatch_output.view(
@@ -110,7 +112,7 @@ class ReferenceMoEBlock(nn.Module):
             len(self.experts), self.cfg.world_size, capacity, self.hidden_dim
         ).transpose(0, 1)
         expert_output = expert_out_4d.reshape(-1, self.hidden_dim)
-        # spy(rank, "Ref Exp Out", expert_output)
+        spy(rank, "Ref Exp Out", expert_output)
 
         # 5. Combine
         reshaped_in = expert_output.view(self.cfg.world_size, tokens_per_rank, self.hidden_dim)
@@ -182,8 +184,8 @@ def check_tensors(rank, name, t_pipe, t_ref, tol=1e-3):
     else:
         diff = (t_pipe - t_ref).abs().max().item()
         logger.error(f"Rank {rank}: ❌ {name} Mismatch! Max Diff: {diff:.6f}")
-        # spy(rank, f"{name} PIPE", t_pipe)
-        # spy(rank, f"{name} REF ", t_ref)
+        spy(rank, f"{name} PIPE", t_pipe)
+        spy(rank, f"{name} REF ", t_ref)
         return False
 
 
