@@ -397,7 +397,7 @@ class PipelineMoEBlock(nn.Module):
                     )
 
                     # We must ensure the output shape matches what Experts expect (2D)
-                    buf["grad_expert_out"] = torch.empty_like(d_moe_flat)
+                    buf["grad_expert_out"] = d_moe_flat.clone()
 
             ev_signal[mb_idx].record(stream)
 
@@ -456,7 +456,7 @@ class PipelineMoEBlock(nn.Module):
                         bloated_out, bloated_in, group=self.group, async_op=False
                     )
 
-                    buf["grad_normed"] = torch.empty_like(d_disp)
+                    buf["grad_normed"] = d_disp.clone()
 
             ev_signal[mb_idx].record(stream)
 
