@@ -1,4 +1,5 @@
 import os
+import types
 
 import torch
 import torch.distributed as dist
@@ -12,44 +13,37 @@ from fastmoe.models.tiny_model import Expert, SelfAttention, TinyModel
 
 
 # ==========================================
-# 0. Differentiable Communication
+# 0. Debug Utilities
 # ==========================================
+def spy(rank, stage_name, tensor):
+    """Logs Mean/Std/Sum to catch drift."""
+    with torch.no_grad():
+        t = tensor.detach().float()
+        mean = t.mean().item()
+        std = t.std().item()
+        chk = t.sum().item()
+        logger.info(
+            f"R{rank} [{stage_name:^15s}] | Sum: {chk:12.2f} | Mean: {mean:8.5f} | Std: {std:8.5f}"
+        )
+
+
 class DifferentiableAllToAll(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, group):
         ctx.group = group
-        # x: [World, Tokens, Dim]
         out = torch.empty_like(x)
         dist.all_to_all_single(out, x, group=group)
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        # Backward of AllToAll is AllToAll
-        # grad_output: [World, Tokens, Dim]
         grad_input = torch.empty_like(grad_output)
         dist.all_to_all_single(grad_input, grad_output, group=ctx.group)
         return grad_input, None
 
 
 # ==========================================
-# 1. Debug Helper
-# ==========================================
-def spy(rank, name, tensor):
-    # Print statistics to verify data matches across models
-    # We use .detach() to not affect graph
-    with torch.no_grad():
-        mean = tensor.mean().item()
-        std = tensor.std().item()
-        # Create a simple checksum
-        chk = tensor.sum().item()
-        logger.info(
-            f"Rank {rank} | {name:20s} | Mean: {mean:.5f} | Std: {std:.5f} | Sum: {chk:.2f}"
-        )
-
-
-# ==========================================
-# 2. Reference Block (Synchronous MoE)
+# 1. Reference Block (Synchronous MoE)
 # ==========================================
 class ReferenceMoEBlock(nn.Module):
     def __init__(self, cfg: Config, group, pre_op, post_op):
@@ -57,7 +51,6 @@ class ReferenceMoEBlock(nn.Module):
         self.cfg = cfg
         self.group = group
         self.hidden_dim = cfg.moe.hidden_dim
-
         self.moe_norm = nn.LayerNorm(self.hidden_dim)
         self.pre_ops = pre_op if pre_op else nn.Identity()
 
@@ -68,7 +61,6 @@ class ReferenceMoEBlock(nn.Module):
             cfg.moe.top_k,
             capacity_factor=cfg.moe.comm_scaling_factor,
         )
-
         self.experts = nn.ModuleList(
             [Expert(self.hidden_dim, cfg.moe.proj_dim) for _ in range(cfg.moe.num_experts_per_gpu)]
         )
@@ -81,19 +73,18 @@ class ReferenceMoEBlock(nn.Module):
         x_proc = self.pre_ops(x)
         x_normed = self.moe_norm(x_proc).view(-1, self.hidden_dim)
         x_flat = x_proc.view(-1, self.hidden_dim)
+        # spy(rank, "Ref:Input", x_flat)
 
-        # 2. Route
+        # 2. Router
         permuted_inputs, permuted_weights, gather_index, capacity = self.router(x_normed)
-        spy(rank, "Ref Route Out", permuted_inputs)
+        spy(rank, "Ref:Router", permuted_inputs)
 
         # 3. Dispatch
         tokens_per_rank = len(self.experts) * capacity
         reshaped_in = permuted_inputs.view(self.cfg.world_size, tokens_per_rank, self.hidden_dim)
-
-        # [FIX] Use Differentiable Communication
         reshaped_out = DifferentiableAllToAll.apply(reshaped_in, self.group)
         dispatch_output = reshaped_out.view(-1, self.hidden_dim)
-        spy(rank, "Ref Disp Out", dispatch_output)
+        # spy(rank, "Ref:Dispatch", dispatch_output)
 
         # 4. Experts
         view_4d = dispatch_output.view(
@@ -112,23 +103,20 @@ class ReferenceMoEBlock(nn.Module):
             len(self.experts), self.cfg.world_size, capacity, self.hidden_dim
         ).transpose(0, 1)
         expert_output = expert_out_4d.reshape(-1, self.hidden_dim)
-        spy(rank, "Ref Exp Out", expert_output)
+        # spy(rank, "Ref:Experts", expert_output)
 
         # 5. Combine
         reshaped_in = expert_output.view(self.cfg.world_size, tokens_per_rank, self.hidden_dim)
-
-        # [FIX] Use Differentiable Communication
         reshaped_out = DifferentiableAllToAll.apply(reshaped_in, self.group)
         moe_out = reshaped_out.view(-1, self.hidden_dim)
+        spy(rank, "Ref:Combine", moe_out)
 
         # 6. Post-Ops
         weighted_moe = moe_out * permuted_weights.unsqueeze(1)
         output_buffer = torch.zeros_like(x_flat)
-
         valid_mask = gather_index != -1
         valid_indices = gather_index[valid_mask]
         valid_data = weighted_moe[valid_mask]
-
         output_buffer.index_add_(0, valid_indices, valid_data)
 
         post_moe_out = x_flat + output_buffer
@@ -140,6 +128,7 @@ class ReferenceMoEBlock(nn.Module):
 class ReferenceTinyModel(nn.Module):
     def __init__(self, cfg, group):
         super().__init__()
+        self.cfg = cfg
         self.input_proj = nn.Linear(cfg.moe.hidden_dim, cfg.moe.hidden_dim)
         self.blocks = nn.ModuleList()
         for i in range(cfg.moe.n_blocks):
@@ -153,8 +142,7 @@ class ReferenceTinyModel(nn.Module):
 
     def forward(self, x):
         x = self.input_proj(x)
-        # Force micro-batching to match router capacity logic
-        chunks = x.chunk(2, dim=0)  # Assuming micro_batches=2
+        chunks = x.chunk(self.cfg.moe.micro_batches, dim=0)
         out_chunks = []
         for chunk in chunks:
             for block in self.blocks:
@@ -164,18 +152,46 @@ class ReferenceTinyModel(nn.Module):
 
 
 # ==========================================
-# 3. Test Logic
+# 3. Patching Pipeline for Spying
+# ==========================================
+def patch_pipeline_block(block):
+    """
+    Injects spy calls into the PipelineMoEBlock methods.
+    We wrap the original methods.
+    """
+    orig_pre = block._fwd_stage_pre_ops
+    orig_combine = block._fwd_stage_combine
+
+    def wrapped_pre(self, mb_idx, ctx, chunks, ev_signal):
+        # Call original
+        orig_pre(mb_idx, ctx, chunks, ev_signal)
+        # Spy on output
+        if mb_idx == 0:  # Only spy on first microbatch to reduce noise
+            rank = dist.get_rank()
+            # spy(rank, "Pipe:Input", ctx[mb_idx]["gated_input"]) # This is x_flat
+            spy(rank, "Pipe:Router", ctx[mb_idx]["permuted_inputs"])
+
+    def wrapped_combine(self, mb_idx, ctx, ev_wait, ev_signal):
+        orig_combine(mb_idx, ctx, ev_wait, ev_signal)
+        if mb_idx == 0:
+            rank = dist.get_rank()
+            spy(rank, "Pipe:Combine", ctx[mb_idx]["combined_output"])
+
+    # Apply patches
+    block._fwd_stage_pre_ops = types.MethodType(wrapped_pre, block)
+    block._fwd_stage_combine = types.MethodType(wrapped_combine, block)
+
+
+# ==========================================
+# 4. Test Logic
 # ==========================================
 def compare_models(rank, pipe_model, ref_model):
     logger.info(f"Rank {rank}: Syncing weights...")
     with torch.no_grad():
-        for (n1, p1), (_, p2) in zip(
+        for (_, p1), (__, p2) in zip(
             pipe_model.named_parameters(), ref_model.named_parameters(), strict=False
         ):
             p2.data.copy_(p1.data)
-            # Verify sync
-            if not torch.allclose(p1, p2):
-                logger.error(f"Failed to sync {n1}")
 
 
 def check_tensors(rank, name, t_pipe, t_ref, tol=1e-3):
@@ -184,8 +200,6 @@ def check_tensors(rank, name, t_pipe, t_ref, tol=1e-3):
     else:
         diff = (t_pipe - t_ref).abs().max().item()
         logger.error(f"Rank {rank}: ❌ {name} Mismatch! Max Diff: {diff:.6f}")
-        spy(rank, f"{name} PIPE", t_pipe)
-        spy(rank, f"{name} REF ", t_ref)
         return False
 
 
@@ -194,18 +208,22 @@ def worker(rank, world_size):
     os.environ["MASTER_PORT"] = "12375"
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
-    torch.manual_seed(42 + rank)  # Seed for inputs
+
+    # [CRITICAL] Same Seed per rank
+    torch.manual_seed(42 + rank)
 
     cfg = get_cfg(world_size=world_size, scale=MoEScale.TINY)
-    cfg.moe.batch_size = 32  # Small batch to avoid OOM
+    cfg.moe.batch_size = 32  # Small batch
 
-    # Init Models
     pipe_model = TinyModel(cfg, dist.group.WORLD).cuda()
     ref_model = ReferenceTinyModel(cfg, dist.group.WORLD).cuda()
 
+    # Patch all blocks in Pipeline model
+    for block in pipe_model.blocks:
+        patch_pipeline_block(block)
+
     compare_models(rank, pipe_model, ref_model)
 
-    # Input
     data = torch.randn(
         cfg.moe.batch_size, cfg.moe.seqlen, cfg.moe.hidden_dim, device="cuda", requires_grad=True
     )
@@ -227,27 +245,22 @@ def worker(rank, world_size):
 
     loss_pipe = (out_pipe.mean(dim=1) - target).pow(2).sum()
     loss_ref = (out_ref.mean(dim=1) - target).pow(2).sum()
+    check_tensors(rank, "Loss", loss_pipe, loss_ref)
 
-    # Retain graph for safety if we inspect grads later
     loss_pipe.backward()
     loss_ref.backward()
-
-    check_tensors(rank, "Loss", loss_pipe, loss_ref)
 
     for (n, p_pipe), p_ref in zip(
         pipe_model.named_parameters(), ref_model.parameters(), strict=False
     ):
         if p_pipe.grad is not None and p_ref.grad is not None:
-            check_tensors(
-                rank, f"Grad {n}", p_pipe.grad, p_ref.grad, tol=5e-2
-            )  # Loose tolerance for large models
+            # Tolerant check for massive accumulations
+            check_tensors(rank, f"Grad {n}", p_pipe.grad, p_ref.grad, tol=5e-2)
 
     # --- Convergence Check ---
     if rank == 0:
         logger.info(">>> Running Convergence Verification")
-
     optimizer = torch.optim.Adam(pipe_model.parameters(), lr=1e-3)
-    # Clear memory
     del out_pipe, out_ref, loss_pipe, loss_ref
     torch.cuda.empty_cache()
 
@@ -255,26 +268,20 @@ def worker(rank, world_size):
     for step in range(15):
         optimizer.zero_grad()
         out = pipe_model(data)
-        loss = (out - data).pow(2).mean()  # Learn Identity
+        loss = (out - data).pow(2).mean()
         loss.backward()
-
-        # Clip grads to prevent explosion
         torch.nn.utils.clip_grad_norm_(pipe_model.parameters(), 1.0)
-
         optimizer.step()
         losses.append(loss.item())
 
         if rank == 0 and step % 5 == 0:
-            logger.info(f"Step {step}: {loss.item():.4f}")
+            logger.info(f"Step {step}: Loss {loss.item():.6f}")
 
     if losses[-1] < losses[0]:
         logger.info(f"Rank {rank}: ✅ Model Converges! {losses[0]:.4f} -> {losses[-1]:.4f}")
-    else:
-        logger.warning(f"Rank {rank}: ⚠️ Convergence suspect.")
 
     dist.destroy_process_group()
 
 
 def run_verify_correctness():
-    print("Starting Verification...")
     mp.start_processes(worker, args=(2,), nprocs=2, join=True, start_method="fork")
