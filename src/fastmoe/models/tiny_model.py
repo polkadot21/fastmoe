@@ -650,7 +650,7 @@ class TinyModel(nn.Module):
         # Input Projection
         self.input_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
 
-        # Get the shared streams (Compute, Comm, Expert)
+        # Get the shared streams (Compute, Comm)
         self.streams: dict[Streams, torch.cuda.Stream] = get_ep_streams()
         self.blocks = nn.ModuleList()
 
