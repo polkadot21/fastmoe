@@ -253,8 +253,7 @@ class PipelineMoEBlock(nn.Module):
                         bloated_out, bloated_in, group=self.group, async_op=False
                     )
 
-                    # New tensor -> implicitly detached.
-                    buf["dispatch_output"] = torch.empty_like(normed_in)
+                    buf["dispatch_output"] = normed_in.clone()
 
             ev_signal[mb_idx].record(stream)
 
@@ -301,7 +300,7 @@ class PipelineMoEBlock(nn.Module):
                     )
 
                     # Implicitly detached
-                    buf["combined_output"] = torch.empty_like(expert_out)
+                    buf["combined_output"] = expert_out.clone()
 
             ev_signal[mb_idx].record(stream)
 
