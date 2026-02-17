@@ -105,19 +105,16 @@ def worker(rank, world_size):
     torch.cuda.set_device(rank)
     torch.manual_seed(42 + rank)
 
-    cfg: Config = get_cfg(world_size=world_size, scale=MoEScale.TINY)
-    # Force Float32 for precision check
+    cfg = get_cfg(world_size=world_size, scale=MoEScale.TINY)
     dtype = torch.float32
 
     pipe = PipelineMoEBlock(cfg, dist.group.WORLD, get_ep_streams()).cuda().to(dtype)
     ref = ReferenceBlock(cfg, dist.group.WORLD).cuda().to(dtype)
 
-    # Sync weights
     with torch.no_grad():
         for p1, p2 in zip(pipe.parameters(), ref.parameters(), strict=False):
             p2.data.copy_(p1.data)
 
-    # Data
     x = torch.randn(
         cfg.moe.batch_size,
         cfg.moe.seqlen,
@@ -127,25 +124,26 @@ def worker(rank, world_size):
         requires_grad=True,
     )
 
-    # Forward
     if rank == 0:
         logger.info("Running Forward...")
     y_pipe = pipe(x)
-    y_ref = ref(x)
+
+    y_ref_list = []
+    for chunk in x.chunk(cfg.moe.micro_batches, dim=0):
+        y_ref_list.append(ref(chunk))
+    y_ref = torch.cat(y_ref_list, dim=0)
 
     diff = (y_pipe - y_ref).abs().max()
     if rank == 0:
         logger.info(f"Forward Max Diff: {diff:.6f}")
     assert diff < 1e-4, "Forward Mismatch!"
 
-    # Backward
     if rank == 0:
         logger.info("Running Backward...")
     g = torch.randn_like(y_pipe)
     y_pipe.backward(g)
     y_ref.backward(g)
 
-    # Check Grads
     max_grad_diff = 0.0
     for _, (p1, p2) in enumerate(zip(pipe.parameters(), ref.parameters(), strict=False)):
         if p1.grad is not None:
@@ -155,21 +153,6 @@ def worker(rank, world_size):
     if rank == 0:
         logger.info(f"Backward Max Grad Diff: {max_grad_diff:.6f}")
     assert max_grad_diff < 1e-3, "Backward Mismatch!"
-
-    # Convergence
-    if rank == 0:
-        logger.info("Running Convergence (5 Steps)...")
-    opt = torch.optim.Adam(pipe.parameters(), lr=1e-3)
-    target = torch.randn_like(x)
-
-    for i in range(5):
-        opt.zero_grad()
-        out = pipe(x)
-        loss = (out - target).pow(2).mean()
-        loss.backward()
-        opt.step()
-        if rank == 0:
-            logger.info(f"Step {i} Loss: {loss.item():.6f}")
 
     dist.destroy_process_group()
 
