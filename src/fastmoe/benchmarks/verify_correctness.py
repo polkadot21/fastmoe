@@ -8,7 +8,7 @@ from loguru import logger
 from torch.autograd import Function
 
 from fastmoe.comm import get_ep_streams
-from fastmoe.config import Config, MoEScale
+from fastmoe.config import MoEScale, get_cfg
 from fastmoe.models.router import TopKRouter
 from fastmoe.models.tiny_model import PipelineMoEBlock
 
@@ -103,7 +103,7 @@ def worker(rank, world_size):
     torch.cuda.set_device(rank)
     torch.manual_seed(42 + rank)
 
-    cfg = Config(world_size=world_size, moe=MoEScale.TINY)
+    cfg = get_cfg(world_size=world_size, moe=MoEScale.TINY)
     # Force Float32 for precision check
     dtype = torch.float32
 
