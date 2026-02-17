@@ -17,9 +17,7 @@ from fastmoe.models.tiny_model import Expert, SelfAttention, TinyModel
 # ==========================================
 def spy(rank, stage_name, tensor):
     """Logs Mean/Std/Sum to catch drift."""
-
     torch.cuda.synchronize()
-
     with torch.no_grad():
         t = tensor.detach().float()
         mean = t.mean().item()
@@ -49,83 +47,131 @@ class DifferentiableAllToAll(torch.autograd.Function):
 # 1. Reference Block (Synchronous MoE)
 # ==========================================
 class ReferenceMoEBlock(nn.Module):
+    """
+    Structurally identical to PipelineMoEBlock, but executes sequentially.
+    """
+
     def __init__(self, cfg: Config, group, pre_op, post_op):
         super().__init__()
         self.cfg = cfg
         self.group = group
         self.hidden_dim = cfg.moe.hidden_dim
-        self.moe_norm = nn.LayerNorm(self.hidden_dim)
-        self.pre_ops = pre_op if pre_op else nn.Identity()
 
+        # --- 1. Align Definition Order with PipelineMoEBlock ---
+        # Pipeline defines: InputLN, PostAttnLN, PreOps, PostOps, Shared, Gate, Locals
+
+        self.input_layernorm = nn.LayerNorm(self.hidden_dim)
+        self.post_attention_layernorm = nn.LayerNorm(self.hidden_dim)
+
+        self.pre_ops = pre_op if pre_op else nn.Identity()
+        self.post_ops = post_op if post_op else nn.Identity()
+
+        # Shared Expert
+        self.shared_experts = nn.Linear(self.hidden_dim, self.hidden_dim)
+
+        # Router (named 'gate' to match Pipeline)
         total_experts = cfg.moe.num_experts_per_gpu * cfg.world_size
-        self.router = TopKRouter(
+        self.gate = TopKRouter(
             self.hidden_dim,
             total_experts,
             cfg.moe.top_k,
             capacity_factor=cfg.moe.comm_scaling_factor,
         )
-        self.experts = nn.ModuleList(
+
+        # Local Experts (named 'local_experts' to match Pipeline)
+        self.local_experts = nn.ModuleList(
             [Expert(self.hidden_dim, cfg.moe.proj_dim) for _ in range(cfg.moe.num_experts_per_gpu)]
         )
-        self.post_ops = post_op if post_op else nn.Identity()
 
     def forward(self, x):
         rank = dist.get_rank()
 
-        # 1. Pre-Ops
-        x_proc = self.pre_ops(x)
-        x_normed = self.moe_norm(x_proc).view(-1, self.hidden_dim)
-        x_flat = x_proc.view(-1, self.hidden_dim)
+        # 1. Pre-Ops / Attention Path
+        residual = x
+        x_norm = self.input_layernorm(x)
+        attn_out = self.pre_ops(x_norm)
+        x_mid = residual + attn_out
+
+        # 2. MoE Path Prep
+        residual_moe = x_mid
+        x_norm_moe = self.post_attention_layernorm(x_mid)
+        x_flat = x_norm_moe.view(-1, self.hidden_dim)
+
         spy(rank, "Ref:Input", x_flat)
 
-        # 2. Router
-        permuted_inputs, permuted_weights, gather_index, capacity = self.router(x_normed)
+        # 3. Shared Expert
+        shared_out = self.shared_experts(x_norm_moe)
+
+        # 4. Router
+        permuted_inputs, permuted_weights, gather_index, capacity = self.gate(x_flat)
         spy(rank, "Ref:Router", permuted_inputs)
 
-        # 3. Dispatch
-        tokens_per_rank = len(self.experts) * capacity
+        # 5. Dispatch
+        # Flattened for AllToAll: [World * Local * Capacity, D]
+        # Our Router returns [Total_Experts * Capacity, D]
+        # In Reference, we simulate the distributed nature locally.
+
+        # Note: TopKRouter output 'permuted_inputs' is sorted by Expert ID [0..Total-1].
+        # We need to shard this to simulate network traffic if we want perfect matching,
+        # but logically we just need to run the correct experts on correct tokens.
+
+        # However, to use DifferentiableAllToAll and match the Pipeline trace exactly,
+        # we strictly follow the dispatch flow.
+
+        tokens_per_rank = len(self.local_experts) * capacity
+
+        # [World, TokensPerRank, D]
         reshaped_in = permuted_inputs.view(self.cfg.world_size, tokens_per_rank, self.hidden_dim)
+
+        # Emulate Dispatch
         reshaped_out = DifferentiableAllToAll.apply(reshaped_in, self.group)
         dispatch_output = reshaped_out.view(-1, self.hidden_dim)
+
         spy(rank, "Ref:Dispatch", dispatch_output)
 
-        # 4. Experts
+        # 6. Experts (Run Local)
+        # Input: [World, Local, Cap, D] -> [Local, World, Cap, D]
         view_4d = dispatch_output.view(
-            self.cfg.world_size, len(self.experts), capacity, self.hidden_dim
+            self.cfg.world_size, len(self.local_experts), capacity, self.hidden_dim
         )
         expert_input_grouped = view_4d.transpose(0, 1).reshape(
-            len(self.experts), -1, self.hidden_dim
+            len(self.local_experts), -1, self.hidden_dim
         )
 
         res = []
-        for i in range(len(self.experts)):
-            res.append(self.experts[i](expert_input_grouped[i]))
+        for i in range(len(self.local_experts)):
+            res.append(self.local_experts[i](expert_input_grouped[i]))
         expert_out_grouped = torch.stack(res, dim=0)
 
+        # Output: [Local, World, Cap, D] -> [World, Local, Cap, D]
         expert_out_4d = expert_out_grouped.view(
-            len(self.experts), self.cfg.world_size, capacity, self.hidden_dim
+            len(self.local_experts), self.cfg.world_size, capacity, self.hidden_dim
         ).transpose(0, 1)
         expert_output = expert_out_4d.reshape(-1, self.hidden_dim)
+
         spy(rank, "Ref:Experts", expert_output)
 
-        # 5. Combine
+        # 7. Combine
         reshaped_in = expert_output.view(self.cfg.world_size, tokens_per_rank, self.hidden_dim)
         reshaped_out = DifferentiableAllToAll.apply(reshaped_in, self.group)
         moe_out = reshaped_out.view(-1, self.hidden_dim)
+
         spy(rank, "Ref:Combine", moe_out)
 
-        # 6. Post-Ops
+        # 8. Post-Ops (Un-Permute)
         weighted_moe = moe_out * permuted_weights.unsqueeze(1)
+
         output_buffer = torch.zeros_like(x_flat)
         valid_mask = gather_index != -1
         valid_indices = gather_index[valid_mask]
         valid_data = weighted_moe[valid_mask]
+
         output_buffer.index_add_(0, valid_indices, valid_data)
 
-        post_moe_out = x_flat + output_buffer
-        reshaped_in = post_moe_out.view(x.shape)
+        # Final Sum: Residual + MoE + Shared
+        post_moe_out = residual_moe + output_buffer.view_as(residual_moe) + shared_out
 
-        return self.post_ops(reshaped_in)
+        return self.post_ops(post_moe_out)
 
 
 class ReferenceTinyModel(nn.Module):
@@ -135,23 +181,26 @@ class ReferenceTinyModel(nn.Module):
         self.input_proj = nn.Linear(cfg.moe.hidden_dim, cfg.moe.hidden_dim)
         self.blocks = nn.ModuleList()
         for i in range(cfg.moe.n_blocks):
-            pre = SelfAttention(cfg.moe.hidden_dim, cfg.moe.num_heads) if i == 0 else None
-            post = (
-                SelfAttention(cfg.moe.hidden_dim, cfg.moe.num_heads)
-                if i < cfg.moe.n_blocks - 1
-                else nn.Linear(cfg.moe.hidden_dim, cfg.moe.hidden_dim)
-            )
+            # Match TinyModel Construction
+            if i == 0:
+                pre = SelfAttention(cfg.moe.hidden_dim, cfg.moe.num_heads)
+            else:
+                pre = None  # Identity
+
+            if i < cfg.moe.n_blocks - 1:
+                post = SelfAttention(cfg.moe.hidden_dim, cfg.moe.num_heads)
+            else:
+                post = nn.Linear(cfg.moe.hidden_dim, cfg.moe.hidden_dim)
+
             self.blocks.append(ReferenceMoEBlock(cfg, group, pre, post))
 
     def forward(self, x):
         x = self.input_proj(x)
-        chunks = x.chunk(self.cfg.moe.micro_batches, dim=0)
-        out_chunks = []
-        for chunk in chunks:
-            for block in self.blocks:
-                chunk = block(chunk)
-            out_chunks.append(chunk)
-        return torch.cat(out_chunks, dim=0)
+        # Reference doesn't need chunking logic for math, but we do it to match behavior if needed.
+        # Simple forward is enough for correctness check.
+        for block in self.blocks:
+            x = block(x)
+        return x
 
 
 # ==========================================
@@ -170,14 +219,15 @@ def patch_pipeline_block(block):
         orig_pre(mb_idx, ctx, chunks, ev_signal)
         if mb_idx == 0:
             rank = dist.get_rank()
-            spy(rank, "Pipe:Input", ctx[mb_idx]["gated_input"])  # This is x_flat
-            spy(rank, "Pipe:Router", ctx[mb_idx]["permuted_inputs"])
+            # In Pipeline, input to router is x_flat (from x_norm_moe)
+            spy(rank, "Pipe:Input", ctx[mb_idx]["x_norm_moe"].view(-1, self.hidden_dim))
+            spy(rank, "Pipe:Router", ctx[mb_idx]["perm_in"])
 
     def wrapped_combine(self, mb_idx, ctx, ev_wait, ev_signal):
         orig_combine(mb_idx, ctx, ev_wait, ev_signal)
         if mb_idx == 0:
             rank = dist.get_rank()
-            spy(rank, "Pipe:Combine", ctx[mb_idx]["combined_output"])
+            spy(rank, "Pipe:Combine", ctx[mb_idx]["combined"])
 
     # Apply patches
     block._fwd_stage_pre_ops = types.MethodType(wrapped_pre, block)
@@ -185,15 +235,28 @@ def patch_pipeline_block(block):
 
 
 # ==========================================
-# 4. Test Logic
+# 4. Test Logic (Corrected)
 # ==========================================
 def compare_models(rank, pipe_model, ref_model):
     logger.info(f"Rank {rank}: Syncing weights...")
     with torch.no_grad():
-        for (_, p1), (__, p2) in zip(
-            pipe_model.named_parameters(), ref_model.named_parameters(), strict=False
-        ):
-            p2.data.copy_(p1.data)
+        # Iterate over named parameters to debug mismatches if they occur
+        pipe_params = dict(pipe_model.named_parameters())
+        ref_params = dict(ref_model.named_parameters())
+
+        # We assume keys match because classes are now structurally identical.
+        # We iterate over Ref to ensure we cover the reference.
+        for name, p_ref in ref_params.items():
+            if name in pipe_params:
+                p_pipe = pipe_params[name]
+                if p_ref.shape != p_pipe.shape:
+                    logger.error(
+                        f"Shape Mismatch at {name}: Pipe {p_pipe.shape} vs Ref {p_ref.shape}"
+                    )
+                    raise RuntimeError("Shape Mismatch")
+                p_ref.data.copy_(p_pipe.data)
+            else:
+                logger.warning(f"Key {name} missing in Pipeline Model!")
 
 
 def check_tensors(rank, name, t_pipe, t_ref, tol=1e-3):
