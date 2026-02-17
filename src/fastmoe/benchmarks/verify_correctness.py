@@ -103,7 +103,7 @@ def worker(rank, world_size):
     torch.cuda.set_device(rank)
     torch.manual_seed(42 + rank)
 
-    cfg = get_cfg(world_size=world_size, moe=MoEScale.TINY)
+    cfg = get_cfg(world_size=world_size, scale=MoEScale.TINY)
     # Force Float32 for precision check
     dtype = torch.float32
 
