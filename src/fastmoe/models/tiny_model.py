@@ -114,30 +114,32 @@ class MoEOverlapFunction(Function):
 # Configurable PipeLine Block
 # ==========================================
 class PipelineMoEBlock(nn.Module):
-    def __init__(self, cfg, group, streams):
+    def __init__(self, cfg: Config, group, streams):
         super().__init__()
         self.cfg = cfg
-        self.n_mb = cfg.micro_batches
+        self.n_mb = cfg.moe.micro_batches
         self.group = group
         self.streams = streams
-        self.hidden_dim = cfg.hidden_dim
+        self.hidden_dim = cfg.moe.hidden_dim
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
         # Modules (Ordered same as Reference)
-        self.input_layernorm = nn.LayerNorm(cfg.hidden_dim)
-        self.post_attention_layernorm = nn.LayerNorm(cfg.hidden_dim)
-        self.shared_experts = nn.Linear(cfg.hidden_dim, cfg.hidden_dim)
+        self.input_layernorm = nn.LayerNorm(cfg.moe.hidden_dim)
+        self.post_attention_layernorm = nn.LayerNorm(cfg.moe.hidden_dim)
+        self.shared_experts = nn.Linear(cfg.moe.hidden_dim, cfg.moe.hidden_dim)
 
-        self.gate = TopKRouter(cfg.hidden_dim, cfg.num_experts_per_gpu * self.world_size, cfg.top_k)
+        self.gate = TopKRouter(
+            cfg.moe.hidden_dim, cfg.moe.num_experts_per_gpu * self.world_size, cfg.moe.top_k
+        )
 
-        self.num_local_experts = cfg.num_experts_per_gpu
+        self.num_local_experts = cfg.moe.num_experts_per_gpu
         self.local_experts = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.Linear(cfg.hidden_dim, cfg.proj_dim),
+                    nn.Linear(cfg.moe.hidden_dim, cfg.moe.proj_dim),
                     nn.GELU(),
-                    nn.Linear(cfg.proj_dim, cfg.hidden_dim),
+                    nn.Linear(cfg.moe.proj_dim, cfg.moe.hidden_dim),
                 )
                 for _ in range(self.num_local_experts)
             ]
