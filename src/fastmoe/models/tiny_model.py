@@ -55,30 +55,25 @@ class MoEOverlapFunction(Function):
     @staticmethod
     def forward(ctx, x, block):
         ctx.block = block
-
-        # Split into micro-batches
         chunks = x.chunk(block.n_mb, dim=0)
-        MB = block.n_mb
 
-        # Contexts for each MB to store intermediate tensors
-        fwd_ctx = [{} for _ in range(MB)]
-        outputs = [None] * MB
+        # Storage
+        fwd_ctx = [{} for _ in range(block.n_mb)]
+        outputs = [None] * block.n_mb
 
-        # CUDA Events for Synchronization
-        ev_pre = [torch.cuda.Event() for _ in range(MB)]
-        ev_disp = [torch.cuda.Event() for _ in range(MB)]
-        ev_exp = [torch.cuda.Event() for _ in range(MB)]
-        ev_comb = [torch.cuda.Event() for _ in range(MB)]
+        # Events
+        ev_pre = [torch.cuda.Event() for _ in range(block.n_mb)]
+        ev_disp = [torch.cuda.Event() for _ in range(block.n_mb)]
+        ev_exp = [torch.cuda.Event() for _ in range(block.n_mb)]
+        ev_comb = [torch.cuda.Event() for _ in range(block.n_mb)]
 
-        # Tick Loop (Pipeline Schedule)
-        total_ticks = MB + 4
+        total_ticks = block.n_mb + 4
         for tick in range(total_ticks):
-            # Compute Stages
+            # Pipeline Schedule
             block._fwd_stage_post_ops(tick - 4, fwd_ctx, outputs, ev_comb, chunks)
             block._fwd_stage_experts(tick - 2, fwd_ctx, ev_disp, ev_exp)
             block._fwd_stage_pre_ops(tick, fwd_ctx, chunks, ev_pre)
 
-            # Comm Stages
             block._fwd_stage_combine(tick - 3, fwd_ctx, ev_exp, ev_comb)
             block._fwd_stage_dispatch(tick - 1, fwd_ctx, ev_pre, ev_disp)
 
@@ -92,21 +87,18 @@ class MoEOverlapFunction(Function):
     def backward(ctx, grad_output):
         block = ctx.block
         fwd_ctx = ctx.fwd_ctx
-        MB = block.n_mb
+        grad_chunks = grad_output.chunk(block.n_mb, dim=0)
 
-        grad_chunks = grad_output.chunk(MB, dim=0)
+        ev_post = [torch.cuda.Event() for _ in range(block.n_mb)]
+        ev_comb = [torch.cuda.Event() for _ in range(block.n_mb)]
+        ev_exp = [torch.cuda.Event() for _ in range(block.n_mb)]
+        ev_disp = [torch.cuda.Event() for _ in range(block.n_mb)]
 
-        # Backward Events
-        ev_post = [torch.cuda.Event() for _ in range(MB)]
-        ev_comb = [torch.cuda.Event() for _ in range(MB)]
-        ev_exp = [torch.cuda.Event() for _ in range(MB)]
-        ev_disp = [torch.cuda.Event() for _ in range(MB)]
-
-        dx_list = [None] * MB
-        total_ticks = MB + 4
+        dx_list = [None] * block.n_mb
+        total_ticks = block.n_mb + 4
 
         for tick in range(total_ticks):
-            # Reverse pipeline order
+            # Reverse pipeline
             block._bwd_stage_pre_ops(tick - 4, fwd_ctx, ev_disp, dx_list)
             block._bwd_stage_experts(tick - 2, fwd_ctx, ev_comb, ev_exp)
             block._bwd_stage_post_ops(tick, fwd_ctx, grad_chunks, ev_post)
@@ -115,10 +107,6 @@ class MoEOverlapFunction(Function):
             block._bwd_stage_combine(tick - 1, fwd_ctx, ev_post, ev_comb)
 
         torch.cuda.current_stream().wait_stream(block.streams[Streams.COMPUTE])
-
-        if not ctx.needs_input_grad[0]:
-            return None, None
-
         return torch.cat(dx_list, dim=0), None
 
 
@@ -126,71 +114,39 @@ class MoEOverlapFunction(Function):
 # Configurable PipeLine Block
 # ==========================================
 class PipelineMoEBlock(nn.Module):
-    def __init__(
-        self,
-        cfg: Config,
-        group: dist.ProcessGroup,
-        block_name: str,
-        pre_op_module: nn.Module | None,
-        post_op_module: nn.Module | None,
-        streams: dict[Streams, torch.cuda.Stream],
-    ) -> None:
+    def __init__(self, cfg, group, streams):
         super().__init__()
         self.cfg = cfg
-        self.block_name = block_name
+        self.n_mb = cfg.micro_batches
         self.group = group
         self.streams = streams
-
-        # --- Config Mapping ---
-        # Map 'cfg' (Test) values to attributes expected by the Pipeline logic
-        self.n_mb = cfg.moe.micro_batches
-        self.hidden_dim = cfg.moe.hidden_dim
+        self.hidden_dim = cfg.hidden_dim
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
-        # --- 1. Replicated Modules (Built from scratch for Testing) ---
-        self.input_layernorm = nn.LayerNorm(self.hidden_dim)
-        self.post_attention_layernorm = nn.LayerNorm(self.hidden_dim)
+        # Modules (Ordered same as Reference)
+        self.input_layernorm = nn.LayerNorm(cfg.hidden_dim)
+        self.post_attention_layernorm = nn.LayerNorm(cfg.hidden_dim)
+        self.shared_experts = nn.Linear(cfg.hidden_dim, cfg.hidden_dim)
 
-        # Pre/Post Ops (Attention / Linear) provided by TinyModel
-        self.pre_ops = pre_op_module if pre_op_module else nn.Identity()
-        self.post_ops = post_op_module if post_op_module else nn.Identity()
+        self.gate = TopKRouter(cfg.hidden_dim, cfg.num_experts_per_gpu * self.world_size, cfg.top_k)
 
-        # Shared Expert (Dummy implementation for test parity)
-        # We use a simple Linear to mimic the shared expert
-        self.shared_experts = nn.Linear(self.hidden_dim, self.hidden_dim)
-
-        # --- 2. Router ---
-        total_experts = cfg.moe.num_experts_per_gpu * self.world_size
-        self.gate = TopKRouter(
-            hidden_dim=self.hidden_dim,
-            num_total_experts=total_experts,
-            top_k=cfg.moe.top_k,
-            capacity_factor=cfg.moe.comm_scaling_factor,
-        )
-
-        # --- 3. Sharded Experts ---
-        # In test mode, we only initialize the LOCAL experts for this rank.
-        self.num_local_experts = cfg.moe.num_experts_per_gpu
+        self.num_local_experts = cfg.num_experts_per_gpu
         self.local_experts = nn.ModuleList(
-            [Expert(self.hidden_dim, cfg.moe.proj_dim) for _ in range(self.num_local_experts)]
+            [
+                nn.Sequential(
+                    nn.Linear(cfg.hidden_dim, cfg.proj_dim),
+                    nn.GELU(),
+                    nn.Linear(cfg.proj_dim, cfg.hidden_dim),
+                )
+                for _ in range(self.num_local_experts)
+            ]
         )
 
-        self.cap_factor = cfg.moe.comm_scaling_factor
-
-    # Bridge between TinyModel's expected interface and the Production Logic
-    @property
-    def self_attn(self):
-        """Alias pre_ops as self_attn to match Production Logic names."""
-        return self.pre_ops
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return MoEOverlapFunction.apply(x, self)
 
-    # =========================================================================
-    # FORWARD STAGES (Identical to Production)
-    # =========================================================================
-
+    # --- Forward Stages ---
     def _fwd_stage_pre_ops(self, mb, ctx, chunks, ev_signal):
         if not (0 <= mb < self.n_mb):
             return
@@ -199,29 +155,16 @@ class PipelineMoEBlock(nn.Module):
             x = chunks[mb]
             ctx[mb]["x_in"] = x
 
-            # 1. Attn Path (Simulated by Pre-Ops)
-            residual = x
+            # Simple Pre-Op (Simulates Attention)
             x_norm = self.input_layernorm(x)
+            residual_moe = x + x_norm  # Dummy Attn
+            x_norm_moe = self.post_attention_layernorm(residual_moe)
 
-            # In TinyModel, pre_ops IS the attention mechanism
-            attn_out = self.pre_ops(x_norm)
-
-            # If pre_ops is Identity, attn_out is x_norm.
-            # TinyModel logic might differ slightly from GigaChat here,
-            # but we follow the structure: Residual + Attn
-            x_mid = residual + attn_out
-
-            # 2. MoE Path
-            residual_moe = x_mid
-            x_norm_moe = self.post_attention_layernorm(x_mid)
-            x_flat = x_norm_moe.view(-1, self.hidden_dim)
-
-            # 3. Routing
-            perm_in, perm_w, gather_idx, cap = self.gate(x_flat)
+            perm_in, perm_w, gather_idx, cap = self.gate(x_norm_moe.view(-1, self.hidden_dim))
 
             ctx[mb]["residual_moe"] = residual_moe
             ctx[mb]["x_norm_moe"] = x_norm_moe
-            ctx[mb]["perm_in"] = perm_in.detach()
+            ctx[mb]["perm_in"] = perm_in.detach()  # Detach for COMM
             ctx[mb]["perm_w"] = perm_w
             ctx[mb]["gather_idx"] = gather_idx
             ctx[mb]["cap"] = cap
@@ -233,11 +176,7 @@ class PipelineMoEBlock(nn.Module):
         stream = self.streams[Streams.COMM]
         stream.wait_event(ev_wait[mb])
         with torch.cuda.stream(stream):
-            perm_in = ctx[mb]["perm_in"]
-            cap = ctx[mb]["cap"]
-            # [World, LocalExperts*Cap, D]
-            tokens = self.num_local_experts * cap
-            send = perm_in.view(self.world_size, tokens, self.hidden_dim)
+            send = ctx[mb]["perm_in"].view(self.world_size, -1, self.hidden_dim)
             recv = torch.empty_like(send)
             dist.all_to_all_single(recv, send, group=self.group)
             ctx[mb]["dispatched"] = recv.view(-1, self.hidden_dim)
@@ -251,20 +190,15 @@ class PipelineMoEBlock(nn.Module):
         with torch.cuda.stream(stream):
             disp = ctx[mb]["dispatched"]
             cap = ctx[mb]["cap"]
-            # Reshape [World, Local, Cap] -> [Local, World, Cap]
             inp = disp.view(self.world_size, self.num_local_experts, cap, self.hidden_dim)
             inp = inp.transpose(0, 1).reshape(self.num_local_experts, -1, self.hidden_dim)
-            ctx[mb]["expert_input"] = inp.detach()
+            ctx[mb]["expert_in"] = inp.detach().requires_grad_(True)
 
             outs = [expert(inp[i]) for i, expert in enumerate(self.local_experts)]
-
-            stack = torch.stack(outs, dim=0)
-            ctx[mb]["expert_out"] = (
-                stack.view(self.num_local_experts, self.world_size, cap, self.hidden_dim)
-                .transpose(0, 1)
-                .contiguous()
-                .view(-1, self.hidden_dim)
+            stack = torch.stack(outs).view(
+                self.num_local_experts, self.world_size, cap, self.hidden_dim
             )
+            ctx[mb]["expert_out"] = stack.transpose(0, 1).contiguous().view(-1, self.hidden_dim)
         ev_signal[mb].record(stream)
 
     def _fwd_stage_combine(self, mb, ctx, ev_wait, ev_signal):
@@ -283,67 +217,32 @@ class PipelineMoEBlock(nn.Module):
         if not (0 <= mb < self.n_mb):
             return
         stream = self.streams[Streams.COMPUTE]
-
-        # Wait for Combine Stage (on COMM stream) to finish
         stream.wait_event(ev_wait[mb])
-
         with torch.cuda.stream(stream):
             moe_out = ctx[mb]["combined"]
-            perm_w = ctx[mb]["perm_w"]
-            gather_idx = ctx[mb]["gather_idx"]
-            residual = ctx[mb]["residual_moe"]
+            weighted = moe_out * ctx[mb]["perm_w"].unsqueeze(1)
 
-            # Weighted Un-permute
-            weighted = moe_out * perm_w.unsqueeze(1)
+            # Scatter
+            buffer = torch.zeros_like(ctx[mb]["residual_moe"].view(-1, self.hidden_dim))
+            valid = ctx[mb]["gather_idx"] != -1
+            buffer.index_add_(0, ctx[mb]["gather_idx"][valid], weighted[valid])
 
-            # Scatter Add
-            res_flat = residual.view(-1, self.hidden_dim)
-            buffer = torch.zeros_like(res_flat)
+            shared = self.shared_experts(ctx[mb]["x_norm_moe"])
+            outputs[mb] = ctx[mb]["residual_moe"] + buffer.view_as(shared) + shared
 
-            valid = gather_idx != -1
-            buffer.index_add_(0, gather_idx[valid], weighted[valid])
+            ctx[mb]["moe_out_src"] = moe_out
+        # No record needed for last stage
 
-            # Shared Experts
-            shared_out = self.shared_experts(ctx[mb]["x_norm_moe"])
-
-            # Final MoE Block Output
-            moe_final = residual + buffer.view_as(residual) + shared_out
-
-            # In TinyModel, we have an explicit Post-Op (Next Block's Attention or Final Linear)
-            # We run it here.
-            out = self.post_ops(moe_final)
-            outputs[mb] = out
-
-            # Save for grad
-            ctx[mb]["moe_out_grad_src"] = moe_out
-            ctx[mb]["moe_final_input"] = moe_final  # Input to post_ops
-
-    # =========================================================================
-    # BACKWARD STAGES
-    # =========================================================================
-
+    # --- Backward Stages ---
     def _bwd_stage_post_ops(self, mb, ctx, grad_chunks, ev_signal):
         if not (0 <= mb < self.n_mb):
             return
         stream = self.streams[Streams.COMPUTE]
         with torch.cuda.stream(stream):
-            # Gradient comes from Next Block or Loss
-            d_out = grad_chunks[mb]
-
-            # 1. Backprop through Post Ops (Linear/Attn)
-            # We need the input that went INTO post_ops
-            post_in = ctx[mb]["moe_final_input"].detach().requires_grad_(True)
-
-            with torch.enable_grad():
-                post_out = self.post_ops(post_in)
-
-            torch.autograd.backward(post_out, d_out)
-
-            # d_final is the gradient at the output of the MoE block (before post_ops)
-            d_final = post_in.grad
+            d_final = grad_chunks[mb]
             ctx[mb]["d_final"] = d_final
 
-            # 2. Shared Experts Grads
+            # Grad for Shared Experts (Autograd handles math)
             x_norm = ctx[mb]["x_norm_moe"].detach().requires_grad_(True)
             with torch.enable_grad():
                 s_out = self.shared_experts(x_norm)
@@ -358,21 +257,19 @@ class PipelineMoEBlock(nn.Module):
         stream.wait_event(ev_wait[mb])
         with torch.cuda.stream(stream):
             d_final = ctx[mb]["d_final"].view(-1, self.hidden_dim)
-            gather_idx = ctx[mb]["gather_idx"]
-            moe_out = ctx[mb]["moe_out_grad_src"]
 
-            d_weighted = torch.zeros_like(moe_out)
-            valid = gather_idx != -1
-            d_weighted[valid] = d_final[gather_idx[valid]]
+            # 1. Reverse Scatter
+            d_weighted = torch.zeros_like(ctx[mb]["moe_out_src"])
+            valid = ctx[mb]["gather_idx"] != -1
+            d_weighted[valid] = d_final[ctx[mb]["gather_idx"][valid]]
 
-            # Grads for Router Weights
-            d_perm_w = (d_weighted * moe_out).sum(dim=1)
-            ctx[mb]["d_perm_w"] = d_perm_w
+            # 2. Grad for Router Weights
+            ctx[mb]["d_perm_w"] = (d_weighted * ctx[mb]["moe_out_src"]).sum(dim=1)
 
-            # Grads for Expert Output
+            # 3. Grad for Expert Out
             d_moe_out = d_weighted * ctx[mb]["perm_w"].unsqueeze(1)
 
-            # AllToAll
+            # Reverse AllToAll
             send = d_moe_out.view(self.world_size, -1, self.hidden_dim)
             recv = torch.empty_like(send)
             dist.all_to_all_single(recv, send, group=self.group)
@@ -387,7 +284,6 @@ class PipelineMoEBlock(nn.Module):
         with torch.cuda.stream(stream):
             d_out = ctx[mb]["d_expert_out"]
             cap = ctx[mb]["cap"]
-            inp = ctx[mb]["expert_input"]
 
             d_out_grp = d_out.view(self.world_size, self.num_local_experts, cap, self.hidden_dim)
             d_out_grp = (
@@ -396,14 +292,14 @@ class PipelineMoEBlock(nn.Module):
                 .view(self.num_local_experts, -1, self.hidden_dim)
             )
 
-            inp.requires_grad_(True)
+            # Run Local Backward
+            inp = ctx[mb]["expert_in"]
             with torch.enable_grad():
                 outs = [expert(inp[i]) for i, expert in enumerate(self.local_experts)]
                 grouped = torch.stack(outs)
             torch.autograd.backward(grouped, d_out_grp)
 
-            d_inp = inp.grad
-            d_inp = d_inp.view(self.num_local_experts, self.world_size, cap, self.hidden_dim)
+            d_inp = inp.grad.view(self.num_local_experts, self.world_size, cap, self.hidden_dim)
             ctx[mb]["d_dispatch"] = d_inp.transpose(0, 1).contiguous().view(-1, self.hidden_dim)
         ev_signal[mb].record(stream)
 
@@ -425,44 +321,33 @@ class PipelineMoEBlock(nn.Module):
         stream = self.streams[Streams.COMPUTE]
         stream.wait_event(ev_wait[mb])
         with torch.cuda.stream(stream):
-            # Gather gradients
-            d_perm_in = ctx[mb]["d_perm_in"]
-            d_perm_w = ctx[mb]["d_perm_w"]
-            d_final = ctx[mb]["d_final"]
-            d_x_norm_shared = ctx[mb]["d_x_norm_shared"]
-
-            gather_idx = ctx[mb]["gather_idx"]
-            x_norm_moe = ctx[mb]["x_norm_moe"]
-
             # 1. Reverse Permutation
-            d_x_norm_routed = torch.zeros_like(x_norm_moe.view(-1, self.hidden_dim))
-            valid = gather_idx != -1
-            d_x_norm_routed.index_add_(0, gather_idx[valid], d_perm_in[valid])
-            d_x_norm_routed = d_x_norm_routed.view_as(x_norm_moe)
+            d_perm_in = ctx[mb]["d_perm_in"]
+            d_x_norm_routed = torch.zeros_like(ctx[mb]["x_norm_moe"].view(-1, self.hidden_dim))
+            valid = ctx[mb]["gather_idx"] != -1
+            d_x_norm_routed.index_add_(0, ctx[mb]["gather_idx"][valid], d_perm_in[valid])
 
             # 2. Router Backward
-            x_norm_grad = x_norm_moe.detach().requires_grad_(True)
+            x_norm = ctx[mb]["x_norm_moe"].detach().requires_grad_(True)
             with torch.enable_grad():
-                _, pw, _, _ = self.gate(x_norm_grad.view(-1, self.hidden_dim))
-            torch.autograd.backward(pw, d_perm_w)
-            d_x_norm_gate = x_norm_grad.grad
+                _, pw, _, _ = self.gate(x_norm.view(-1, self.hidden_dim))
+            torch.autograd.backward(pw, ctx[mb]["d_perm_w"])
+            d_x_norm_gate = x_norm.grad
 
-            # Total grad at Post-Attn Norm
-            d_x_norm = d_x_norm_routed + d_x_norm_gate + d_x_norm_shared
+            # Sum grads
+            d_x_norm_total = (
+                d_x_norm_routed.view_as(x_norm) + d_x_norm_gate + ctx[mb]["d_x_norm_shared"]
+            )
 
-            # 3. Backprop through Post-LN and Attention
+            # 3. Pre-Op Backward
             x_in = ctx[mb]["x_in"].detach().requires_grad_(True)
+            d_final = ctx[mb]["d_final"]
             with torch.enable_grad():
-                # Replay Fwd Stage 1
-                res = x_in
                 x_n = self.input_layernorm(x_in)
-                attn = self.pre_ops(x_n)  # pre_ops is SelfAttn
-                x_mid = res + attn
-                x_out_norm = self.post_attention_layernorm(x_mid)
+                res_moe = x_in + x_n
+                x_norm_moe = self.post_attention_layernorm(res_moe)
 
-            # d_final flows to x_mid (residual). d_x_norm flows to x_out_norm.
-            torch.autograd.backward((x_out_norm, x_mid), (d_x_norm, d_final))
-
+            torch.autograd.backward((x_norm_moe, res_moe), (d_x_norm_total, d_final))
             dx_list[mb] = x_in.grad
 
 
