@@ -8,30 +8,32 @@ from loguru import logger
 from torch.autograd import Function
 
 from fastmoe.comm import get_ep_streams
-from fastmoe.config import MoEScale, get_cfg
+from fastmoe.config import Config, MoEScale, get_cfg
 from fastmoe.models.router import TopKRouter
 from fastmoe.models.tiny_model import PipelineMoEBlock
 
 
 class ReferenceBlock(nn.Module):
-    def __init__(self, cfg, group):
+    def __init__(self, cfg: Config, group):
         super().__init__()
         self.cfg = cfg
         self.group = group
-        self.input_layernorm = nn.LayerNorm(cfg.hidden_dim)
-        self.post_attention_layernorm = nn.LayerNorm(cfg.hidden_dim)
-        self.shared_experts = nn.Linear(cfg.hidden_dim, cfg.hidden_dim)
+        self.input_layernorm = nn.LayerNorm(cfg.moe.hidden_dim)
+        self.post_attention_layernorm = nn.LayerNorm(cfg.moe.hidden_dim)
+        self.shared_experts = nn.Linear(cfg.moe.hidden_dim, cfg.moe.hidden_dim)
 
-        self.gate = TopKRouter(cfg.hidden_dim, cfg.num_experts_per_gpu * cfg.world_size, cfg.top_k)
+        self.gate = TopKRouter(
+            cfg.moe.hidden_dim, cfg.moe.num_experts_per_gpu * cfg.world_size, cfg.moe.top_k
+        )
 
         self.local_experts = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.Linear(cfg.hidden_dim, cfg.proj_dim),
+                    nn.Linear(cfg.moe.hidden_dim, cfg.moe.proj_dim),
                     nn.GELU(),
-                    nn.Linear(cfg.proj_dim, cfg.hidden_dim),
+                    nn.Linear(cfg.moe.proj_dim, cfg.moe.hidden_dim),
                 )
-                for _ in range(cfg.num_experts_per_gpu)
+                for _ in range(cfg.moe.num_experts_per_gpu)
             ]
         )
 
@@ -66,23 +68,23 @@ class ReferenceBlock(nn.Module):
                 dist.all_to_all_single(dx, dy, group=ctx.g)
                 return dx, None
 
-        disp = DiffAllToAll.apply(reshaped_in, self.group).view(-1, self.cfg.hidden_dim)
+        disp = DiffAllToAll.apply(reshaped_in, self.group).view(-1, self.cfg.moe.hidden_dim)
 
         # 5. Experts
-        inp = disp.view(self.cfg.world_size, len(self.local_experts), cap, self.cfg.hidden_dim)
-        inp = inp.transpose(0, 1).reshape(len(self.local_experts), -1, self.cfg.hidden_dim)
+        inp = disp.view(self.cfg.world_size, len(self.local_experts), cap, self.cfg.moe.hidden_dim)
+        inp = inp.transpose(0, 1).reshape(len(self.local_experts), -1, self.cfg.moe.hidden_dim)
         outs = [exp(inp[i]) for i, exp in enumerate(self.local_experts)]
         stack = torch.stack(outs).view(
-            len(self.local_experts), self.cfg.world_size, cap, self.cfg.hidden_dim
+            len(self.local_experts), self.cfg.world_size, cap, self.cfg.moe.hidden_dim
         )
         exp_out = (
             stack.transpose(0, 1)
             .contiguous()
-            .view(self.cfg.world_size, tokens_local, self.cfg.hidden_dim)
+            .view(self.cfg.world_size, tokens_local, self.cfg.moe.hidden_dim)
         )
 
         # 6. Combine
-        comb = DiffAllToAll.apply(exp_out, self.group).view(-1, self.cfg.hidden_dim)
+        comb = DiffAllToAll.apply(exp_out, self.group).view(-1, self.cfg.moe.hidden_dim)
 
         # 7. Post-Ops
         weighted = comb * perm_w.unsqueeze(1)
@@ -103,7 +105,7 @@ def worker(rank, world_size):
     torch.cuda.set_device(rank)
     torch.manual_seed(42 + rank)
 
-    cfg = get_cfg(world_size=world_size, scale=MoEScale.TINY)
+    cfg: Config = get_cfg(world_size=world_size, scale=MoEScale.TINY)
     # Force Float32 for precision check
     dtype = torch.float32
 
@@ -117,7 +119,12 @@ def worker(rank, world_size):
 
     # Data
     x = torch.randn(
-        cfg.batch_size, cfg.seqlen, cfg.hidden_dim, device="cuda", dtype=dtype, requires_grad=True
+        cfg.moe.batch_size,
+        cfg.moe.seqlen,
+        cfg.moe.hidden_dim,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
     )
 
     # Forward
