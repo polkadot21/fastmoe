@@ -47,12 +47,12 @@ class ReferenceBlock(nn.Module):
         shared = self.shared_experts(x_norm_moe)
 
         # 3. Router
-        x_flat = x_norm_moe.view(-1, self.cfg.hidden_dim)
+        x_flat = x_norm_moe.view(-1, self.cfg.moe.hidden_dim)
         perm_in, perm_w, gather_idx, cap = self.gate(x_flat)
 
         # 4. Dispatch (Simulated via Differentiable AllToAll)
         tokens_local = len(self.local_experts) * cap
-        reshaped_in = perm_in.view(self.cfg.world_size, tokens_local, self.cfg.hidden_dim)
+        reshaped_in = perm_in.view(self.cfg.world_size, tokens_local, self.cfg.moe.hidden_dim)
 
         class DiffAllToAll(Function):
             @staticmethod
